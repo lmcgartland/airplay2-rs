@@ -1,0 +1,11 @@
+[package]
+name = "airplay2-rs"
+version = "0.1.0"
+authors = ["Lucas McGartland <luke.mcgartland@me.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+zeroconf = "0.7.1"
+tokio = { version = "1.4", features = ["full"] }
