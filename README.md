@@ -27,3 +27,8 @@ cargo run
 - [https://openairplay.github.io/airplay-spec/](https://openairplay.github.io/airplay-spec/)
 - [https://emanuelecozzi.net/docs/airplay2](https://emanuelecozzi.net/docs/airplay2)
 - [https://github.com/openairplay/airplay2-receiver](https://github.com/openairplay/airplay2-receiver)
+
+### Notes
+- Docker image not working on M1 Mac
+  - Must be built for x86 arch `docker buildx build --platform linux/amd64 -t airplay:latest .`
+  - Run docker image using host network `docker run --platform linux/amd64 -it --network host airplay:latest /bin/bash`
