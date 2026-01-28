@@ -694,59 +694,97 @@ impl Connection {
             tracing::warn!("Failed to set volume: {}", e);
         }
 
-        // Spawn control channel polling task for retransmit requests before moving streamer
+        // Spawn control channel on a dedicated blocking thread for low-latency
+        // retransmit handling. Uses 5ms recv timeout (well under HomePod's 70ms buffer)
+        // so retransmit requests are handled promptly.
         let control_task = if let Some(ref control_rx) = self.control_receiver {
             use airplay_audio::RetransmitRequest;
             let control_rx_clone = Arc::clone(control_rx);
             let streamer_clone = streamer.clone();
+            let rt_handle = tokio::runtime::Handle::current();
 
-            Some(tokio::spawn(async move {
-                tracing::debug!("Control channel polling task started");
+            Some(tokio::task::spawn_blocking(move || {
+                tracing::debug!("Control channel thread started (5ms poll)");
                 loop {
-                    match control_rx_clone.recv_timeout(std::time::Duration::from_millis(100)) {
-                        Ok(Some(packet)) => {
-                            // Check if it's a retransmit request (PT=85)
-                            if packet.header.payload_type == 85 {
-                                // Retransmit request format: 12-byte packet with seq and count
-                                // Payload should be 4 bytes: [first_seq_hi, first_seq_lo, count_hi, count_lo]
-                                if packet.payload.len() >= 4 {
-                                    let first_sequence = u16::from_be_bytes([packet.payload[0], packet.payload[1]]);
-                                    let count = u16::from_be_bytes([packet.payload[2], packet.payload[3]]);
+                    // Use raw receive to handle all packet formats (including
+                    // retransmit requests which have 8-byte headers without SSRC).
+                    // 5ms timeout keeps retransmit latency low.
+                    match control_rx_clone.recv_raw_timeout(std::time::Duration::from_millis(5)) {
+                        Ok(Some((data, _addr))) => {
+                            if data.len() < 4 {
+                                tracing::debug!("Control channel: ignoring tiny packet ({} bytes)", data.len());
+                                continue;
+                            }
 
-                                    let request = RetransmitRequest {
-                                        first_sequence,
-                                        count,
-                                    };
+                            let payload_type = data[1] & 0x7F;
 
-                                    match streamer_clone.handle_retransmit(&request).await {
+                            if payload_type == 85 {
+                                // Retransmit request (PT=85):
+                                // Apple uses an 8-byte compact format:
+                                //   [0-1] RTP header (V=2, PT=85)
+                                //   [2-3] Sequence number of request
+                                //   [4-5] First lost sequence number
+                                //   [6-7] Number of lost packets
+                                // Or a 12-byte format:
+                                //   [0-7] 8-byte RTP header (no SSRC)
+                                //   [8-9] First lost sequence number
+                                //   [10-11] Number of lost packets
+                                let request = if data.len() == 8 {
+                                    // 8-byte compact format
+                                    let first_sequence = u16::from_be_bytes([data[4], data[5]]);
+                                    let count = u16::from_be_bytes([data[6], data[7]]);
+                                    Some(RetransmitRequest { first_sequence, count })
+                                } else if data.len() >= 12 {
+                                    RetransmitRequest::parse(&data).ok()
+                                } else {
+                                    let hex: String = data.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                                    tracing::debug!(
+                                        "Control channel: PT=85 unexpected len={}, hex=[{}]",
+                                        data.len(), hex
+                                    );
+                                    None
+                                };
+
+                                if let Some(request) = request {
+                                    tracing::debug!(
+                                        "Retransmit request: seq={}, count={}",
+                                        request.first_sequence, request.count
+                                    );
+                                    // Use block_on to call async handle_retransmit from blocking thread
+                                    match rt_handle.block_on(streamer_clone.handle_retransmit(&request)) {
                                         Ok(retransmitted) => {
                                             if retransmitted > 0 {
-                                                tracing::info!("Retransmitted {} packets starting from seq {}",
-                                                    retransmitted, first_sequence);
+                                                tracing::info!(
+                                                    "Retransmitted {} packets starting from seq {}",
+                                                    retransmitted, request.first_sequence
+                                                );
                                             }
                                         }
                                         Err(e) => {
                                             tracing::warn!("Retransmit failed: {}", e);
                                         }
                                     }
-                                } else {
-                                    tracing::warn!("Retransmit request payload too short: {} bytes", packet.payload.len());
                                 }
-                            } else if packet.header.payload_type != 96 {
-                                // Log unexpected packet types (but skip normal audio = 96)
-                                tracing::trace!("Control channel: PT={} (not retransmit)", packet.header.payload_type);
+                            } else if payload_type == 84 {
+                                // Sync/timing packet (PT=84) — can ignore
+                                tracing::trace!("Control channel: sync packet (PT=84, {} bytes)", data.len());
+                            } else {
+                                // Log unknown packet types with hex dump for debugging
+                                let hex: String = data.iter().take(16).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                                tracing::debug!(
+                                    "Control channel: unknown PT={}, len={}, hex=[{}]",
+                                    payload_type, data.len(), hex
+                                );
                             }
                         }
                         Ok(None) => {
                             // Timeout, continue polling
                         }
                         Err(e) => {
-                            tracing::debug!("Control channel recv: {}, continuing", e);
-                            // Don't break - timeouts and errors are expected when no retransmits needed
+                            tracing::debug!("Control channel recv error: {}, continuing", e);
                         }
                     }
                 }
-                tracing::debug!("Control channel polling task stopped");
             }))
         } else {
             None

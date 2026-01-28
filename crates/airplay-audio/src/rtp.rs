@@ -6,6 +6,48 @@ use crate::cipher::PacketCipher;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
+/// Set QoS socket options for real-time audio traffic.
+///
+/// Marks packets with DSCP EF (Expedited Forwarding, 0xB8), which maps to
+/// WiFi WMM AC_VO (Voice) priority. This reduces packet loss on congested
+/// WiFi networks by giving audio packets higher priority than best-effort traffic.
+fn set_socket_qos(socket: &UdpSocket) {
+    use std::os::unix::io::AsRawFd;
+    let fd = socket.as_raw_fd();
+
+    // IP_TOS = DSCP EF (0xB8 = 184). The TOS byte is: DSCP (6 bits) + ECN (2 bits).
+    // EF = 46 << 2 = 0xB8.
+    let tos: libc::c_int = 0xB8;
+    unsafe {
+        let ret = libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_TOS,
+            &tos as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        if ret != 0 {
+            tracing::debug!("Failed to set IP_TOS (DSCP EF): errno={}", std::io::Error::last_os_error());
+        }
+    }
+
+    // On Linux, also set SO_PRIORITY = 6 (maps to TC prio band for AC_VO)
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let prio: libc::c_int = 6;
+        let ret = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PRIORITY,
+            &prio as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        if ret != 0 {
+            tracing::debug!("Failed to set SO_PRIORITY: errno={}", std::io::Error::last_os_error());
+        }
+    }
+}
+
 /// RTP payload types for AirPlay.
 pub mod payload_types {
     pub const TIMING_REQUEST: u8 = 82;
@@ -372,6 +414,7 @@ impl RtpSender {
     /// Bind to local port.
     pub fn bind(&mut self, local_port: u16) -> Result<u16> {
         let socket = UdpSocket::bind(("0.0.0.0", local_port))?;
+        set_socket_qos(&socket);
         let port = socket.local_addr()?.port();
         self.socket = Some(socket);
         Ok(port)
@@ -402,14 +445,15 @@ impl RtpSender {
         Ok(())
     }
 
-    /// Send encoded audio packet.
-    pub fn send_audio(
+    /// Serialize an audio packet (encrypt if cipher set, store in history),
+    /// returning the wire bytes. Shared logic for `send_audio` and `prepare_audio`.
+    fn serialize_audio(
         &mut self,
         payload_type: u8,
         timestamp: u32,
         payload: &[u8],
         marker: bool,
-    ) -> Result<()> {
+    ) -> Result<Vec<u8>> {
         let header = RtpHeader::new(payload_type, self.sequence, timestamp, self.ssrc)
             .with_marker(marker);
 
@@ -466,17 +510,42 @@ impl RtpSender {
         let idx = self.sequence as usize % PACKET_HISTORY_SIZE;
         self.packet_history[idx] = Some(serialized);
 
+        tracing::debug!("Audio packet prepared: seq={}, ts={}, len={}", self.sequence, timestamp, payload.len());
+        self.sequence = self.sequence.wrapping_add(1);
+
+        // Return a reference to the stored copy (avoids clone since we just stored it)
+        Ok(self.packet_history[idx].as_ref().unwrap().clone())
+    }
+
+    /// Send encoded audio packet.
+    pub fn send_audio(
+        &mut self,
+        payload_type: u8,
+        timestamp: u32,
+        payload: &[u8],
+        marker: bool,
+    ) -> Result<()> {
+        let serialized = self.serialize_audio(payload_type, timestamp, payload, marker)?;
+
         let socket = self.socket.as_ref()
             .ok_or_else(|| Error::Streaming(
                 airplay_core::error::StreamingError::Encoding("Socket not bound".into())
             ))?;
-        // Send from history to avoid clone
-        socket.send_to(self.packet_history[idx].as_ref().unwrap(), self.dest)?;
-
-        tracing::debug!("Audio packet sent: seq={}, ts={}, len={}", self.sequence, timestamp, payload.len());
-        self.sequence = self.sequence.wrapping_add(1);
+        socket.send_to(&serialized, self.dest)?;
 
         Ok(())
+    }
+
+    /// Prepare an audio packet for later sending: serialize, encrypt, store in
+    /// history, and return the wire bytes without transmitting.
+    pub fn prepare_audio(
+        &mut self,
+        payload_type: u8,
+        timestamp: u32,
+        payload: &[u8],
+        marker: bool,
+    ) -> Result<Vec<u8>> {
+        self.serialize_audio(payload_type, timestamp, payload, marker)
     }
 
     /// Send sync packet to control port.
@@ -542,6 +611,60 @@ impl RtpSender {
         tracing::debug!("Sync packet sent to {}: rtp_ts={}, ntp_ts={}", dest, rtp_timestamp, ntp_timestamp);
 
         Ok(())
+    }
+
+    /// Prepare a sync packet without sending. Returns the 20-byte packet data,
+    /// or None if the control port is 0 (buffered mode skips sync).
+    pub fn prepare_sync(&mut self, rtp_timestamp: u32, ntp_timestamp: u64) -> Result<Option<Vec<u8>>> {
+        let dest = self.control_dest.unwrap_or(self.dest);
+
+        if dest.port() == 0 {
+            tracing::debug!("Skipping sync packet (no control port for AirPlay 2 buffered)");
+            return Ok(None);
+        }
+
+        let mut packet = [0u8; 20];
+
+        packet[0] = if !self.first_sync_sent {
+            self.first_sync_sent = true;
+            0x90
+        } else {
+            0x80
+        };
+        packet[1] = 0xd4;
+        packet[2..4].copy_from_slice(&self.sync_sequence.to_be_bytes());
+        self.sync_sequence = self.sync_sequence.wrapping_add(1);
+        packet[4..8].copy_from_slice(&rtp_timestamp.to_be_bytes());
+        packet[8..16].copy_from_slice(&ntp_timestamp.to_be_bytes());
+        packet[16..20].copy_from_slice(&rtp_timestamp.to_be_bytes());
+
+        if self.sync_sequence <= 2 {
+            let ntp_secs = (ntp_timestamp >> 32) as u32;
+            let ntp_frac = ntp_timestamp as u32;
+            tracing::info!(
+                "DIAG sync #{}: dest={}, rtp_ts={}, ntp_secs={}, ntp_frac={}, first_byte=0x{:02x}, pkt={:02x?}",
+                self.sync_sequence - 1, dest, rtp_timestamp, ntp_secs, ntp_frac,
+                packet[0], &packet[..20]
+            );
+        }
+
+        Ok(Some(packet.to_vec()))
+    }
+
+    /// Clone the data socket and destination for external use (e.g. sender thread).
+    pub fn clone_data_socket(&self) -> Result<Option<(UdpSocket, SocketAddr)>> {
+        match &self.socket {
+            Some(s) => Ok(Some((s.try_clone()?, self.dest))),
+            None => Ok(None),
+        }
+    }
+
+    /// Clone the control socket and get control destination for external use.
+    pub fn clone_control_socket(&self) -> Result<Option<(UdpSocket, SocketAddr)>> {
+        match (&self.control_socket, self.control_dest) {
+            (Some(s), Some(dest)) => Ok(Some((s.try_clone()?, dest))),
+            _ => Ok(None),
+        }
     }
 
     /// Get current sequence number.
@@ -627,6 +750,7 @@ impl RtpReceiver {
     /// Bind to local port.
     pub fn bind(&mut self, local_port: u16) -> Result<u16> {
         let socket = UdpSocket::bind(("0.0.0.0", local_port))?;
+        set_socket_qos(&socket);
         socket.set_read_timeout(Some(Duration::from_secs(1)))?;
         let port = socket.local_addr()?.port();
         self.socket = Some(socket);
@@ -645,6 +769,26 @@ impl RtpReceiver {
         let mut buf = [0u8; 2048];
         match socket.recv_from(&mut buf) {
             Ok((len, _)) => Ok(Some(RtpPacket::parse(&buf[..len])?)),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Receive raw bytes with timeout (for packets that may not be standard RTP).
+    ///
+    /// Returns `Ok(Some((data, addr)))` on success, `Ok(None)` on timeout.
+    pub fn recv_raw_timeout(&self, timeout: Duration) -> Result<Option<(Vec<u8>, std::net::SocketAddr)>> {
+        let socket = self.socket.as_ref()
+            .ok_or_else(|| Error::Streaming(
+                airplay_core::error::StreamingError::Encoding("Socket not bound".into())
+            ))?;
+
+        socket.set_read_timeout(Some(timeout))?;
+
+        let mut buf = [0u8; 2048];
+        match socket.recv_from(&mut buf) {
+            Ok((len, addr)) => Ok(Some((buf[..len].to_vec(), addr))),
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(None),
             Err(e) => Err(e.into()),

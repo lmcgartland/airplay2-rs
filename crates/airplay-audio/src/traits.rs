@@ -44,6 +44,7 @@ pub trait EncoderTrait: Send {
 mod tests {
     use super::*;
     use airplay_core::SampleRate;
+    use std::sync::Arc;
 
     mod mock_audio_source {
         use super::*;
@@ -68,7 +69,7 @@ mod tests {
                 .times(1)
                 .returning(|| Box::pin(async {
                     Ok(Some(AudioFrame {
-                        samples: vec![0i16; 704],
+                        samples: Arc::new(vec![0i16; 704]),
                         timestamp: 0,
                     }))
                 }));

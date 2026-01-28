@@ -8,6 +8,8 @@ use std::sync::{Arc, atomic::{AtomicU64, AtomicU8, Ordering}};
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration, Instant};
+use crossbeam_channel::{bounded, Sender, Receiver};
+use std::net::{SocketAddr, UdpSocket};
 
 /// Streaming state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +57,255 @@ fn set_realtime_priority() {
     tracing::debug!("RT priority not supported on this platform");
 }
 
+/// Message sent from the async producer to the dedicated sender thread.
+enum SenderMessage {
+    /// A fully serialized packet ready for timed transmission.
+    Packet {
+        /// Pre-serialized wire bytes (RTP header + encrypted payload + tag + nonce).
+        wire_data: Vec<u8>,
+        /// Pre-serialized sync packet bytes, if sync is needed this frame.
+        sync_data: Option<Vec<u8>>,
+    },
+    /// Pause: sender thread should stop advancing deadlines and wait for Resume.
+    Pause,
+    /// Resume: reset deadline to now and resume sending.
+    Resume,
+    /// Stop: sender thread should exit.
+    Stop,
+}
+
+/// Sleep until an absolute deadline using the best available method.
+///
+/// On Linux with SCHED_FIFO, `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)`
+/// provides ~10-50μs precision regardless of CONFIG_HZ. On other platforms,
+/// falls back to spin_sleep.
+#[cfg(target_os = "linux")]
+fn precise_sleep_until(deadline_ns: u64) {
+    use std::mem;
+
+    let ts = libc::timespec {
+        tv_sec: (deadline_ns / 1_000_000_000) as libc::time_t,
+        tv_nsec: (deadline_ns % 1_000_000_000) as libc::c_long,
+    };
+
+    unsafe {
+        // TIMER_ABSTIME = 1, CLOCK_MONOTONIC = 1
+        libc::clock_nanosleep(
+            libc::CLOCK_MONOTONIC,
+            1, // TIMER_ABSTIME
+            &ts as *const libc::timespec,
+            std::ptr::null_mut(),
+        );
+    }
+}
+
+/// Get current CLOCK_MONOTONIC time in nanoseconds.
+#[cfg(target_os = "linux")]
+fn monotonic_now_ns() -> u64 {
+    use std::mem;
+    unsafe {
+        let mut ts: libc::timespec = mem::zeroed();
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts as *mut _);
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
+}
+
+/// Dedicated OS thread for precise packet timing.
+///
+/// On Linux, uses `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)` with
+/// SCHED_FIFO for ~10-50μs precision. On other platforms, falls back to
+/// `spin_sleep` hybrid kernel-sleep + spin-wait.
+fn sender_thread_main(
+    rx: Receiver<SenderMessage>,
+    data_socket: UdpSocket,
+    data_dest: SocketAddr,
+    control_socket: Option<UdpSocket>,
+    control_dest: Option<SocketAddr>,
+    frame_duration: std::time::Duration,
+) {
+    set_realtime_priority();
+
+    let frame_duration_ns = frame_duration.as_nanos() as u64;
+    #[cfg(target_os = "linux")]
+    let mut next_deadline_ns = monotonic_now_ns();
+    #[cfg(not(target_os = "linux"))]
+    let sleeper = spin_sleep::SpinSleeper::default();
+    #[cfg(not(target_os = "linux"))]
+    let mut next_deadline = std::time::Instant::now();
+
+    let mut last_send = std::time::Instant::now();
+    let mut started = false;
+    let mut packet_count: u64 = 0;
+    let mut max_jitter_ms: f64 = 0.0;
+    let mut jitter_sum_ms: f64 = 0.0;
+    let mut jitter_exceed_count: u64 = 0;
+
+    tracing::info!(
+        "Sender thread started: dest={}, frame_duration={:.3}ms, timing={}",
+        data_dest,
+        frame_duration.as_secs_f64() * 1000.0,
+        if cfg!(target_os = "linux") { "clock_nanosleep(TIMER_ABSTIME)" } else { "spin_sleep" }
+    );
+
+    loop {
+        // Receive next message (blocking with timeout for clean shutdown detection)
+        let msg = match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(msg) => msg,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                tracing::info!("Sender thread: channel disconnected, exiting");
+                break;
+            }
+        };
+
+        match msg {
+            SenderMessage::Stop => {
+                tracing::info!("Sender thread: received Stop, exiting");
+                break;
+            }
+            SenderMessage::Pause => {
+                tracing::debug!("Sender thread: paused");
+                loop {
+                    match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                        Ok(SenderMessage::Resume) => {
+                            tracing::debug!("Sender thread: resumed");
+                            #[cfg(target_os = "linux")]
+                            { next_deadline_ns = monotonic_now_ns(); }
+                            #[cfg(not(target_os = "linux"))]
+                            { next_deadline = std::time::Instant::now(); }
+                            break;
+                        }
+                        Ok(SenderMessage::Stop) => {
+                            tracing::info!("Sender thread: received Stop while paused, exiting");
+                            return;
+                        }
+                        _ => continue,
+                    }
+                }
+                continue;
+            }
+            SenderMessage::Resume => {
+                #[cfg(target_os = "linux")]
+                { next_deadline_ns = monotonic_now_ns(); }
+                #[cfg(not(target_os = "linux"))]
+                { next_deadline = std::time::Instant::now(); }
+                continue;
+            }
+            SenderMessage::Packet { wire_data, sync_data } => {
+                if !started {
+                    #[cfg(target_os = "linux")]
+                    { next_deadline_ns = monotonic_now_ns(); }
+                    #[cfg(not(target_os = "linux"))]
+                    { next_deadline = std::time::Instant::now(); }
+                    last_send = std::time::Instant::now();
+                    started = true;
+                } else {
+                    // Wait until the precise deadline
+                    #[cfg(target_os = "linux")]
+                    {
+                        precise_sleep_until(next_deadline_ns);
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let now = std::time::Instant::now();
+                        if next_deadline > now {
+                            sleeper.sleep(next_deadline - now);
+                        }
+                    }
+                }
+
+                // Measure actual interval and jitter
+                let send_time = std::time::Instant::now();
+                let actual_interval = send_time.duration_since(last_send);
+                let interval_ms = actual_interval.as_secs_f64() * 1000.0;
+                let target_ms = frame_duration.as_secs_f64() * 1000.0;
+                let jitter_ms = interval_ms - target_ms;
+
+                // Track jitter stats
+                packet_count += 1;
+                if packet_count > 1 {
+                    let abs_jitter = jitter_ms.abs();
+                    if abs_jitter > max_jitter_ms {
+                        max_jitter_ms = abs_jitter;
+                    }
+                    jitter_sum_ms += abs_jitter;
+                    if abs_jitter > 1.0 {
+                        jitter_exceed_count += 1;
+                    }
+
+                    // Log every packet with >1ms jitter
+                    if abs_jitter > 1.0 {
+                        tracing::warn!(
+                            "JITTER pkt#{}: interval={:.3}ms target={:.3}ms jitter={:+.3}ms",
+                            packet_count, interval_ms, target_ms, jitter_ms
+                        );
+                    }
+
+                    // Log stats every 500 packets (~4s)
+                    if packet_count % 500 == 0 {
+                        let avg_jitter = jitter_sum_ms / (packet_count - 1) as f64;
+                        tracing::info!(
+                            "TIMING STATS after {} pkts: avg_jitter={:.3}ms max_jitter={:.3}ms exceeds_1ms={}",
+                            packet_count, avg_jitter, max_jitter_ms, jitter_exceed_count
+                        );
+                    }
+                }
+
+                last_send = send_time;
+
+                // Send sync packet first if needed
+                if let Some(sync) = sync_data {
+                    if let Some(ref ctrl_sock) = control_socket {
+                        let dest = control_dest.unwrap_or(data_dest);
+                        if let Err(e) = ctrl_sock.send_to(&sync, dest) {
+                            tracing::error!("Failed to send sync packet: {}", e);
+                        }
+                    } else {
+                        let dest = control_dest.unwrap_or(data_dest);
+                        if let Err(e) = data_socket.send_to(&sync, dest) {
+                            tracing::error!("Failed to send sync packet (data socket): {}", e);
+                        }
+                    }
+                }
+
+                // Send audio packet
+                if let Err(e) = data_socket.send_to(&wire_data, data_dest) {
+                    tracing::error!("Failed to send audio packet: {}", e);
+                }
+
+                // Advance deadline
+                #[cfg(target_os = "linux")]
+                {
+                    next_deadline_ns += frame_duration_ns;
+                    // Catch up if we've fallen behind by more than one frame
+                    let now_ns = monotonic_now_ns();
+                    if now_ns > next_deadline_ns + frame_duration_ns {
+                        tracing::warn!(
+                            "Sender thread fell behind by {:.2}ms, resetting deadline",
+                            (now_ns - next_deadline_ns) as f64 / 1_000_000.0
+                        );
+                        next_deadline_ns = now_ns;
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    next_deadline += frame_duration;
+                    let now = std::time::Instant::now();
+                    if now > next_deadline + frame_duration {
+                        tracing::warn!(
+                            "Sender thread fell behind by {:.2}ms, resetting deadline",
+                            (now - next_deadline).as_secs_f64() * 1000.0
+                        );
+                        next_deadline = now;
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::info!("Sender thread exiting");
+}
+
 struct StreamerInner {
     state: StreamerState,
     config: StreamConfig,
@@ -77,6 +328,10 @@ pub struct AudioStreamer {
     task: Option<JoinHandle<Result<()>>>,
     state_cache: Arc<AtomicU8>,
     timestamp_cache: Arc<AtomicU64>,
+    /// Dedicated sender thread for precise packet timing.
+    sender_thread: Option<std::thread::JoinHandle<()>>,
+    /// Channel to send packets to the sender thread.
+    sender_tx: Option<Sender<SenderMessage>>,
 }
 
 impl Clone for AudioStreamer {
@@ -86,6 +341,8 @@ impl Clone for AudioStreamer {
             task: None, // Can't clone JoinHandle, new clone doesn't own the task
             state_cache: Arc::clone(&self.state_cache),
             timestamp_cache: Arc::clone(&self.timestamp_cache),
+            sender_thread: None, // Can't clone JoinHandle
+            sender_tx: self.sender_tx.clone(),
         }
     }
 }
@@ -112,6 +369,8 @@ impl AudioStreamer {
             task: None,
             state_cache: Arc::new(AtomicU8::new(StreamerState::Idle as u8)),
             timestamp_cache: Arc::new(AtomicU64::new(0)),
+            sender_thread: None,
+            sender_tx: None,
         }
     }
 
@@ -144,11 +403,15 @@ impl AudioStreamer {
 
     /// Start streaming from decoder.
     pub async fn start(&mut self, decoder: AudioDecoder) -> Result<()> {
+        let frame_duration_ns;
         {
             let mut inner = self.inner.lock().await;
             inner.decoder = Some(decoder);
             inner.encoder = Some(create_encoder(inner.config.audio_format.clone())?);
             inner.state = StreamerState::Buffering;
+            frame_duration_ns = inner.config.audio_format.frames_per_packet as u64
+                * 1_000_000_000u64
+                / inner.config.audio_format.sample_rate.as_hz() as u64;
         }
         self.state_cache.store(StreamerState::Buffering as u8, Ordering::Relaxed);
 
@@ -161,11 +424,47 @@ impl AudioStreamer {
         }
 
         if self.task.is_none() {
+            // Set up the dedicated sender thread with cloned sockets
+            let (tx, rx) = bounded::<SenderMessage>(8);
+            let frame_duration = std::time::Duration::from_nanos(frame_duration_ns);
+
+            {
+                let inner = self.inner.lock().await;
+                if let Some(ref rtp_sender) = inner.rtp_sender {
+                    if let Ok(Some((data_sock, data_dest))) = rtp_sender.clone_data_socket() {
+                        let ctrl = rtp_sender.clone_control_socket().ok().flatten();
+                        let (ctrl_sock, ctrl_dest) = match ctrl {
+                            Some((s, d)) => (Some(s), Some(d)),
+                            None => (None, None),
+                        };
+
+                        let thread = std::thread::Builder::new()
+                            .name("rt-sender".into())
+                            .spawn(move || {
+                                sender_thread_main(
+                                    rx,
+                                    data_sock,
+                                    data_dest,
+                                    ctrl_sock,
+                                    ctrl_dest,
+                                    frame_duration,
+                                );
+                            })
+                            .expect("Failed to spawn sender thread");
+                        self.sender_thread = Some(thread);
+                        self.sender_tx = Some(tx);
+                    } else {
+                        tracing::warn!("RTP sender has no socket, falling back to async timing");
+                    }
+                }
+            }
+
             let inner = self.inner.clone();
             let state_cache = self.state_cache.clone();
             let timestamp_cache = self.timestamp_cache.clone();
+            let sender_tx = self.sender_tx.clone();
             self.task = Some(tokio::spawn(async move {
-                match run_streamer(inner.clone(), state_cache.clone(), timestamp_cache).await {
+                match run_streamer(inner.clone(), state_cache.clone(), timestamp_cache, sender_tx).await {
                     Ok(()) => tracing::debug!("Streaming task completed normally"),
                     Err(e) => {
                         tracing::error!("Streaming task error: {}", e);
@@ -186,6 +485,9 @@ impl AudioStreamer {
     pub async fn pause(&mut self) -> Result<()> {
         let mut inner = self.inner.lock().await;
         if inner.state == StreamerState::Streaming {
+            if let Some(ref tx) = self.sender_tx {
+                let _ = tx.try_send(SenderMessage::Pause);
+            }
             inner.state = StreamerState::Paused;
             self.state_cache.store(StreamerState::Paused as u8, Ordering::Relaxed);
         }
@@ -196,6 +498,9 @@ impl AudioStreamer {
     pub async fn resume(&mut self) -> Result<()> {
         let mut inner = self.inner.lock().await;
         if inner.state == StreamerState::Paused {
+            if let Some(ref tx) = self.sender_tx {
+                let _ = tx.try_send(SenderMessage::Resume);
+            }
             inner.state = StreamerState::Streaming;
             self.state_cache.store(StreamerState::Streaming as u8, Ordering::Relaxed);
         }
@@ -214,6 +519,19 @@ impl AudioStreamer {
 
     /// Stop streaming.
     pub async fn stop(&mut self) -> Result<()> {
+        // Signal sender thread to stop
+        if let Some(ref tx) = self.sender_tx {
+            let _ = tx.try_send(SenderMessage::Stop);
+        }
+
+        // Wait for sender thread to finish
+        if let Some(handle) = self.sender_thread.take() {
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = handle.join();
+            }).await;
+        }
+        self.sender_tx = None;
+
         let mut inner = self.inner.lock().await;
         inner.state = StreamerState::Stopped;
         inner.buffer.flush();
@@ -295,10 +613,8 @@ async fn run_streamer(
     inner: Arc<Mutex<StreamerInner>>,
     state_cache: Arc<AtomicU8>,
     timestamp_cache: Arc<AtomicU64>,
+    sender_tx: Option<Sender<SenderMessage>>,
 ) -> Result<()> {
-    // Try to set RT priority for better timing precision
-    set_realtime_priority();
-
     // Compute frame duration once (constant for the session)
     let frame_duration_ns = {
         let guard = inner.lock().await;
@@ -306,6 +622,14 @@ async fn run_streamer(
             / guard.config.audio_format.sample_rate.as_hz() as u64
     };
     let frame_duration = Duration::from_nanos(frame_duration_ns);
+
+    let has_sender_thread = sender_tx.is_some();
+
+    // Only set RT priority if we're NOT using the dedicated sender thread
+    // (the sender thread sets its own RT priority)
+    if !has_sender_thread {
+        set_realtime_priority();
+    }
 
     // Use absolute deadline scheduling so processing time doesn't cause drift
     let mut next_deadline = Instant::now();
@@ -387,7 +711,7 @@ async fn run_streamer(
                     );
                 }
 
-                // Encode synchronously (but lock is only held during encode+send, not during sleep)
+                // Encode synchronously
                 let encode_start = Instant::now();
                 let encoder = guard
                     .encoder
@@ -448,49 +772,112 @@ async fn run_streamer(
                     || rtp_ts.wrapping_sub(last_sync_rtp) >= sample_rate;
 
                 if let Some(ref mut sender) = guard.rtp_sender {
-                    // Send sync BEFORE first audio packet so receiver knows
-                    // the NTP-to-RTP timestamp mapping before any audio arrives
-                    if need_sync {
-                        sender.send_sync(rtp_ts, ntp)?;
+                    if let Some(ref tx) = sender_tx {
+                        // Sender thread path: prepare packets and send via channel
+                        let sync_data = if need_sync {
+                            sender.prepare_sync(rtp_ts, ntp)?
+                        } else {
+                            None
+                        };
+
+                        let wire_data = sender.prepare_audio(payload_type, rtp_ts, &packet.data, marker)?;
+
+                        if diag < 5 || diag % 500 == 0 {
+                            tracing::info!(
+                                "DIAG timing #{}: encode={:.2}ms (sender thread handles send timing)",
+                                diag,
+                                encode_elapsed.as_secs_f64() * 1000.0,
+                            );
+                        }
+
+                        // Update state BEFORE sending to channel, since the
+                        // blocking path drops the guard and continues
+                        if need_sync {
+                            guard.last_sync_rtp = rtp_ts;
+                        }
+                        if first_packet {
+                            guard.first_packet_sent = true;
+                        }
+                        guard.current_timestamp = packet.timestamp + packet.samples as u64;
+                        timestamp_cache.store(guard.current_timestamp, Ordering::Relaxed);
+
+                        // Send to the sender thread via the bounded channel.
+                        // Drop the mutex guard first so other async tasks (NTP, control)
+                        // can proceed while we wait for channel space.
+                        drop(guard);
+                        let tx_clone = tx.clone();
+                        let msg = SenderMessage::Packet { wire_data, sync_data };
+                        let send_result = tokio::task::spawn_blocking(move || {
+                            tx_clone.send(msg)
+                        }).await;
+                        match send_result {
+                            Ok(Ok(())) => {},
+                            _ => {
+                                tracing::error!("Sender thread disconnected");
+                                state_cache.store(StreamerState::Error as u8, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                        // Guard was dropped; continue to next iteration
+                        continue;
+                    } else {
+                        // Fallback: direct send (no sender thread)
+                        if need_sync {
+                            sender.send_sync(rtp_ts, ntp)?;
+                        }
+
+                        let send_start = Instant::now();
+                        sender.send_audio(payload_type, rtp_ts, &packet.data, marker)?;
+                        let send_elapsed = send_start.elapsed();
+
+                        if diag < 5 || diag % 500 == 0 {
+                            tracing::info!(
+                                "DIAG timing #{}: encode={:.2}ms, send={:.2}ms, total={:.2}ms",
+                                diag,
+                                encode_elapsed.as_secs_f64() * 1000.0,
+                                send_elapsed.as_secs_f64() * 1000.0,
+                                (encode_elapsed + send_elapsed).as_secs_f64() * 1000.0
+                            );
+                        }
+
+                        if need_sync {
+                            guard.last_sync_rtp = rtp_ts;
+                        }
+                        if first_packet {
+                            guard.first_packet_sent = true;
+                        }
+                        guard.current_timestamp = packet.timestamp + packet.samples as u64;
+                        timestamp_cache.store(guard.current_timestamp, Ordering::Relaxed);
                     }
-
-                    let send_start = Instant::now();
-                    sender.send_audio(payload_type, rtp_ts, &packet.data, marker)?;
-                    let send_elapsed = send_start.elapsed();
-
-                    if diag < 5 || diag % 500 == 0 {
-                        tracing::info!(
-                            "DIAG timing #{}: encode={:.2}ms, send={:.2}ms, total={:.2}ms",
-                            diag,
-                            encode_elapsed.as_secs_f64() * 1000.0,
-                            send_elapsed.as_secs_f64() * 1000.0,
-                            (encode_elapsed + send_elapsed).as_secs_f64() * 1000.0
-                        );
-                    }
                 }
-
-                if need_sync {
-                    guard.last_sync_rtp = rtp_ts;
-                }
-                if first_packet {
-                    guard.first_packet_sent = true;
-                }
-
-                guard.current_timestamp = packet.timestamp + packet.samples as u64;
-                timestamp_cache.store(guard.current_timestamp, Ordering::Relaxed);
             } else {
                 guard.state = StreamerState::Buffering;
                 state_cache.store(StreamerState::Buffering as u8, Ordering::Relaxed);
             }
         }
 
-        // Advance deadline by one frame period and sleep until that absolute time.
-        // With RT priority, tokio::time::sleep should be more precise.
-        next_deadline += frame_duration;
-        let now = Instant::now();
-        if next_deadline > now {
-            tokio::time::sleep(next_deadline - now).await;
+        if has_sender_thread {
+            // With sender thread: no sleep needed here. The bounded channel
+            // provides natural backpressure - when it's full, the blocking send
+            // (via spawn_blocking) throttles us to match the sender thread's
+            // consumption rate. This keeps the channel maximally filled so the
+            // sender thread never starves.
+            //
+            // Yield to let other Tokio tasks run (NTP, control, etc.)
+            tokio::task::yield_now().await;
+        } else {
+            // Without sender thread: use deadline-based timing (original behavior)
+            next_deadline += frame_duration;
+            let now = Instant::now();
+            if next_deadline > now {
+                tokio::time::sleep(next_deadline - now).await;
+            }
         }
+    }
+
+    // Signal sender thread to stop when streaming loop exits
+    if let Some(ref tx) = sender_tx {
+        let _ = tx.try_send(SenderMessage::Stop);
     }
 
     Ok(())

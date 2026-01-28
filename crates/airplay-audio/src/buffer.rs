@@ -184,7 +184,7 @@ mod tests {
             let samples = vec![1i16, 2, 3, 4, 5, 6];
             let frame = AudioFrame::new(samples.clone(), 12345);
 
-            assert_eq!(frame.samples, samples);
+            assert_eq!(*frame.samples, samples);
             assert_eq!(frame.timestamp, 12345);
         }
 
