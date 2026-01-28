@@ -48,14 +48,14 @@ cargo test --workspace
 ### Cross-compilation (for Raspberry Pi)
 
 ```bash
-# Build for Pi 3/4/5 (64-bit)
-./cross-compile.sh aarch64-unknown-linux-gnu
+# Build for Pi 3/4/5/Zero 2 W (64-bit)
+./utils/cross-compile.sh aarch64-unknown-linux-gnu
 
 # Build for Pi 2/3/4/Zero 2 (32-bit)
-./cross-compile.sh armv7-unknown-linux-gnueabihf
+./utils/cross-compile.sh armv7-unknown-linux-gnueabihf
 
 # Build for Pi Zero/1 (ARMv6)
-./cross-compile.sh arm-unknown-linux-gnueabihf
+./utils/cross-compile.sh arm-unknown-linux-gnueabihf
 ```
 
 ## Quick Start
@@ -136,9 +136,9 @@ Full terminal interface with device browser, file picker, playback controls, and
 
 This implementation supports two timing protocols for clock synchronization between sender and receiver.
 
-### NTP-style Timing (Single Room) ✓ Working
+### NTP-style Timing ✓ Working
 
-**When to use**: AirPlay 1 devices and single-device AirPlay 2 playback.
+**When to use**: AirPlay 1 devices and AirPlay 2 playback (including HomePod).
 
 NTP timing uses a simple request-response protocol on an ephemeral UDP port negotiated during SETUP:
 - Receiver sends timing requests (RTP PT=82) to the sender
@@ -178,9 +178,27 @@ sudo cargo run -p airplay-client --example play_audio -- <ip> <port> <file> --ai
 - Both protocols implement the `TimingProtocol` trait for clock offset calculation
 - The timing protocol is negotiated during RTSP SETUP Phase 1 (`timingProtocol: "NTP"` or `timingProtocol: "PTP"`)
 
+## Real-time Audio on Raspberry Pi
+
+The audio streamer is optimized for low-jitter playback on resource-constrained devices like the Raspberry Pi Zero 2 W:
+
+- **Dedicated sender thread** with `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)` and `SCHED_FIFO` real-time priority achieves ~5 microsecond average jitter (vs ~1.5ms with async sleep)
+- **Retransmit handling** for UDP packet loss — parses Apple's 8-byte compact retransmit request format and responds within 5ms
+- **DSCP EF marking** on audio sockets for WiFi WMM Voice priority
+
+### Recommended Pi setup for best audio quality
+
+```bash
+# Disable WiFi power management (prevents radio sleep between packets)
+sudo iwconfig wlan0 power off
+
+# Run with root for SCHED_FIFO real-time priority
+sudo ./play_audio <ip> <port> <file> --airplay2
+```
+
 ## Notes
 
-- **HomePod**: Requires AirPlay 2 with PTP timing (`--airplay2 --ptp`).
+- **HomePod**: Works with AirPlay 2 and NTP timing (`--airplay2`). PTP timing is experimental.
 - **Transient pairing**: HomePod and HomeKit devices accept SRP transient pairing (M1-M4) with PIN `3939`. No pair-verify step is needed afterward.
 
 ## Architecture
