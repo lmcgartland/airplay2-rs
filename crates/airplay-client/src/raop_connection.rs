@@ -75,6 +75,8 @@ pub struct RaopConnection {
     control_receiver: Option<RtpReceiver>,
     /// Password for digest auth (if needed)
     password: Option<String>,
+    /// Render delay in ms added to NTP timestamps for extra retransmit headroom.
+    render_delay_ms: u32,
 }
 
 impl RaopConnection {
@@ -175,6 +177,7 @@ impl RaopConnection {
             timing_server: None,
             control_receiver: None,
             password,
+            render_delay_ms: 0,
         })
     }
 
@@ -405,6 +408,9 @@ impl RaopConnection {
         // Start streamer
         let mut streamer = AudioStreamer::new(self.stream_config.clone());
         streamer.set_rtp_sender(sender).await;
+        if self.render_delay_ms > 0 {
+            streamer.set_render_delay_ms(self.render_delay_ms).await;
+        }
         // NTP timing: sender is reference clock, offset is zero
         streamer
             .set_timing_offset(airplay_timing::ClockOffset::default())
@@ -470,6 +476,15 @@ impl RaopConnection {
 
         self.playback_state = PlaybackState::Stopped;
         Ok(())
+    }
+
+    /// Set render delay in milliseconds.
+    ///
+    /// Shifts NTP timestamps in sync packets into the future, telling the
+    /// receiver to buffer audio longer before rendering. Must be called
+    /// before `start_streaming()`. Typical values: 100-500ms.
+    pub fn set_render_delay_ms(&mut self, delay_ms: u32) {
+        self.render_delay_ms = delay_ms;
     }
 
     /// Set volume (0.0 to 1.0).

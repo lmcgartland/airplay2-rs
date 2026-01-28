@@ -112,6 +112,8 @@ pub struct Connection {
     control_receiver: Option<Arc<RtpReceiver>>,
     /// Reverse connection to device's events port (required before RECORD)
     events_stream: Option<TcpStream>,
+    /// Render delay in ms added to NTP timestamps for extra retransmit headroom.
+    render_delay_ms: u32,
 }
 
 impl Connection {
@@ -227,6 +229,7 @@ impl Connection {
             control_receiver: None,
             control_task: None,
             events_stream: None,
+            render_delay_ms: 0,
         })
     }
 
@@ -661,6 +664,9 @@ impl Connection {
         // Start streamer
         let mut streamer = AudioStreamer::new(self.stream_config.clone());
         streamer.set_rtp_sender(sender).await;
+        if self.render_delay_ms > 0 {
+            streamer.set_render_delay_ms(self.render_delay_ms).await;
+        }
         if let Some(offset) = self.timing_offset {
             streamer.set_timing_offset(offset).await;
         }
@@ -864,6 +870,17 @@ impl Connection {
         self.playback_state = PlaybackState::Stopped;
 
         Ok(())
+    }
+
+    /// Set render delay in milliseconds.
+    ///
+    /// Shifts NTP timestamps in sync packets into the future, telling the
+    /// receiver to buffer audio longer before rendering. This gives more
+    /// headroom for retransmit recovery of lost packets over lossy WiFi.
+    ///
+    /// Must be called before `start_streaming()`. Typical values: 100-500ms.
+    pub fn set_render_delay_ms(&mut self, delay_ms: u32) {
+        self.render_delay_ms = delay_ms;
     }
 
     /// Set volume.
@@ -1196,6 +1213,7 @@ mod tests {
                     frames_per_packet: 352,
                 },
                 timing_protocol: TimingProtocol::Ntp,
+                ptp_mode: airplay_core::PtpMode::Master,
                 latency_min: 22050,
                 latency_max: 132300,
                 supports_dynamic_stream_id: true,

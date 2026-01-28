@@ -39,6 +39,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  --ptp            Use PTP timing (default: NTP)");
         eprintln!("  --ptp-master     PTP: Act as timing master (for 3rd-party receivers) (default)");
         eprintln!("  --ptp-slave      PTP: Act as timing slave (for HomePod multi-room)");
+        eprintln!("  --render-delay N Render delay in ms (shifts NTP timestamps forward for retransmit headroom)");
         std::process::exit(1);
     }
 
@@ -51,6 +52,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let use_ptp = args.iter().any(|a| a == "--ptp");
     let ptp_slave = args.iter().any(|a| a == "--ptp-slave");
     let ptp_master = args.iter().any(|a| a == "--ptp-master");
+    let render_delay_ms: u32 = args.iter()
+        .position(|a| a == "--render-delay")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     let timing_protocol = if use_ptp {
         TimingProtocol::Ptp
@@ -80,6 +86,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== AirPlay Audio Test ===");
     println!("Target: {}:{}", ip, port);
     println!("Protocol: {}", protocol_name);
+    if render_delay_ms > 0 {
+        println!("Render delay: {}ms", render_delay_ms);
+    }
     println!("Audio file: {}", audio_path);
 
     // Open audio file first to validate it
@@ -140,6 +149,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         // AirPlay 2 path: HomeKit pairing + encrypted RTSP
         println!("\n--- Connecting (AirPlay 2) ---");
         let mut conn = Connection::connect(device, config).await?;
+        if render_delay_ms > 0 {
+            conn.set_render_delay_ms(render_delay_ms);
+        }
         println!("Connected!");
 
         println!("\n--- Setting up stream ---");
@@ -177,6 +189,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         // AirPlay 1 / RAOP path: no pairing, plaintext RTSP, AES-CBC audio
         println!("\n--- Connecting (RAOP) ---");
         let mut conn = RaopConnection::connect(device, config).await?;
+        if render_delay_ms > 0 {
+            conn.set_render_delay_ms(render_delay_ms);
+        }
         println!("Connected!");
 
         println!("\n--- Setting up stream ---");

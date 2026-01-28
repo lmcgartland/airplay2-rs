@@ -320,6 +320,10 @@ struct StreamerInner {
     encoder: Option<Box<dyn AudioEncoder>>,
     /// Track whether first audio packet has been sent (requires marker bit)
     first_packet_sent: bool,
+    /// Render delay in nanoseconds added to NTP timestamps in sync packets.
+    /// Tells the receiver to render audio this far in the future, giving more
+    /// time for retransmit recovery of lost packets.
+    render_delay_ns: u64,
 }
 
 /// High-level audio streamer.
@@ -365,6 +369,7 @@ impl AudioStreamer {
                 decoder: None,
                 encoder: None,
                 first_packet_sent: false,
+                render_delay_ns: 0,
             })),
             task: None,
             state_cache: Arc::new(AtomicU8::new(StreamerState::Idle as u8)),
@@ -377,6 +382,17 @@ impl AudioStreamer {
     /// Configure RTP sender.
     pub async fn set_rtp_sender(&mut self, sender: RtpSender) {
         self.inner.lock().await.rtp_sender = Some(sender);
+    }
+
+    /// Set render delay in milliseconds.
+    ///
+    /// This shifts NTP timestamps in sync packets into the future, telling
+    /// the receiver to buffer audio longer before rendering. This gives more
+    /// time for retransmit recovery of lost packets.
+    pub async fn set_render_delay_ms(&mut self, delay_ms: u32) {
+        let delay_ns = delay_ms as u64 * 1_000_000;
+        self.inner.lock().await.render_delay_ns = delay_ns;
+        tracing::info!("Render delay set to {}ms ({}ns)", delay_ms, delay_ns);
     }
 
     /// Handle retransmit request from control channel.
@@ -756,7 +772,11 @@ async fn run_streamer(
                     local_wall
                 };
 
-                let ntp = unix_to_ntp(adjusted);
+                // Apply render delay: shift NTP timestamp into the future so the
+                // receiver buffers audio longer before rendering, giving more
+                // time for retransmit recovery of lost packets.
+                let render_adjusted = adjusted + guard.render_delay_ns;
+                let ntp = unix_to_ntp(render_adjusted);
 
                 // Set marker bit on first audio packet (required by some receivers)
                 let first_packet = !guard.first_packet_sent;
