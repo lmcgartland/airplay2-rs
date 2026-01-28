@@ -1,0 +1,37 @@
+[package]
+name = "airplay-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Terminal user interface for AirPlay 2 audio streaming"
+
+[[bin]]
+name = "airplay-tui"
+path = "src/main.rs"
+
+[dependencies]
+airplay-client = { path = "../airplay-client" }
+airplay-core = { path = "../airplay-core" }
+
+# TUI
+ratatui = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# Async
+tokio.workspace = true
+futures.workspace = true
+
+# Error handling
+anyhow = "1.0"
+
+# Filesystem
+dirs = "5.0"
+
+# Audio metadata
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "alac", "flac"] }
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender = "0.2"
