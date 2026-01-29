@@ -94,6 +94,22 @@ pub enum Action {
     /// Tick for periodic updates.
     Tick,
 
+    // Equalizer actions
+    /// Select previous EQ band.
+    EqSelectPrevBand,
+    /// Select next EQ band.
+    EqSelectNextBand,
+    /// Increase gain for selected band (+1 dB).
+    EqIncreaseGain,
+    /// Decrease gain for selected band (-1 dB).
+    EqDecreaseGain,
+    /// Toggle EQ bypass.
+    EqToggleBypass,
+    /// Toggle EQ expanded view.
+    EqToggleExpanded,
+    /// Reset all EQ bands to flat.
+    EqReset,
+
     // Bluetooth actions (Linux only)
     #[cfg(feature = "bluetooth")]
     /// Check Bluetooth system setup.

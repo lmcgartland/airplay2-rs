@@ -24,6 +24,9 @@ spin_sleep = "1.2"
 alac-encoder.workspace = true
 fdk-aac.workspace = true
 
+# Audio processing
+biquad = "0.4"
+
 [dev-dependencies]
 tokio-test.workspace = true
 mockall.workspace = true

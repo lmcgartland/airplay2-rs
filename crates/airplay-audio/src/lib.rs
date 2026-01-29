@@ -14,6 +14,7 @@
 pub mod cipher;
 mod decoder;
 mod encoder;
+pub mod eq;
 mod live_decoder;
 mod rtp;
 mod buffer;
@@ -22,6 +23,7 @@ mod traits;
 
 pub use decoder::{AudioDecoder, DecodedFrame};
 pub use encoder::{AlacEncoder, AacEncoder, AudioEncoder, EncodedPacket, create_encoder};
+pub use eq::{EqConfig, EqParams, Equalizer};
 pub use live_decoder::{LiveAudioDecoder, LiveFrameSender, LivePcmFrame};
 pub use rtp::{RtpPacket, RtpSender, RtpReceiver, RtpHeader, RetransmitRequest, build_retransmit_response};
 pub use buffer::{AudioBuffer, AudioFrame};

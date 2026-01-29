@@ -1,7 +1,8 @@
 //! Application state management.
 
 use airplay_core::Device;
-use airplay_client::{PlaybackState, DeviceGroup};
+use airplay_client::{PlaybackState, DeviceGroup, EqConfig, EqParams};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Current view being displayed.
@@ -168,6 +169,10 @@ pub struct AppState {
     /// Selected index in group member list.
     pub group_member_index: usize,
 
+    // Equalizer state
+    /// Audio equalizer state.
+    pub eq: EqState,
+
     // Bluetooth state (Linux only)
     #[cfg(feature = "bluetooth")]
     pub bluetooth: BluetoothState,
@@ -178,6 +183,139 @@ pub struct AppState {
 pub struct DeviceGroupState {
     pub leader: Device,
     pub members: Vec<GroupMemberState>,
+}
+
+/// Equalizer state for UI.
+#[derive(Debug)]
+pub struct EqState {
+    /// Shared EQ parameters (atomic updates for audio thread).
+    pub params: Arc<EqParams>,
+    /// EQ configuration (band frequencies and labels).
+    pub config: EqConfig,
+    /// Currently selected band index.
+    pub selected_band: usize,
+    /// Whether the EQ UI is expanded/visible.
+    pub expanded: bool,
+}
+
+impl EqState {
+    /// Create new EQ state with default 5-band configuration.
+    pub fn new() -> Self {
+        let config = EqConfig::five_band();
+        let params = Arc::new(EqParams::new(config.num_bands()));
+        Self {
+            params,
+            config,
+            selected_band: 0,
+            expanded: false,
+        }
+    }
+
+    /// Create EQ state with a specific configuration.
+    pub fn with_config(config: EqConfig) -> Self {
+        let params = Arc::new(EqParams::new(config.num_bands()));
+        Self {
+            params,
+            config,
+            selected_band: 0,
+            expanded: false,
+        }
+    }
+
+    /// Get a clone of the shared params Arc for passing to the audio thread.
+    pub fn params_arc(&self) -> Arc<EqParams> {
+        Arc::clone(&self.params)
+    }
+
+    /// Select the previous band.
+    pub fn select_prev_band(&mut self) {
+        if self.selected_band > 0 {
+            self.selected_band -= 1;
+        }
+    }
+
+    /// Select the next band.
+    pub fn select_next_band(&mut self) {
+        if self.selected_band < self.config.num_bands() - 1 {
+            self.selected_band += 1;
+        }
+    }
+
+    /// Increase gain for the selected band by 1 dB.
+    pub fn increase_gain(&self) {
+        self.params.adjust_gain_db(self.selected_band, 1.0);
+    }
+
+    /// Decrease gain for the selected band by 1 dB.
+    pub fn decrease_gain(&self) {
+        self.params.adjust_gain_db(self.selected_band, -1.0);
+    }
+
+    /// Toggle EQ bypass.
+    pub fn toggle_bypass(&self) {
+        self.params.toggle_bypass();
+    }
+
+    /// Reset all bands to flat (0 dB).
+    pub fn reset(&self) {
+        self.params.reset();
+    }
+
+    /// Toggle expanded state.
+    pub fn toggle_expanded(&mut self) {
+        self.expanded = !self.expanded;
+    }
+
+    /// Check if EQ is bypassed.
+    pub fn is_bypassed(&self) -> bool {
+        self.params.is_bypassed()
+    }
+
+    /// Get the gain for the selected band.
+    pub fn selected_gain_db(&self) -> f32 {
+        self.params.get_gain_db(self.selected_band)
+    }
+
+    /// Get all gains for display.
+    pub fn all_gains_db(&self) -> Vec<f32> {
+        self.params.get_all_gains_db()
+    }
+
+    /// Get the frequency label for a band.
+    pub fn band_label(&self, band: usize) -> &str {
+        self.config.labels.get(band).map(|s| s.as_str()).unwrap_or("")
+    }
+
+    /// Get the frequency in Hz for a band.
+    pub fn band_freq(&self, band: usize) -> f32 {
+        *self.config.frequencies.get(band).unwrap_or(&0.0)
+    }
+
+    /// Format frequency as a display string.
+    pub fn format_freq(freq: f32) -> String {
+        if freq >= 1000.0 {
+            format!("{:.0}kHz", freq / 1000.0)
+        } else {
+            format!("{:.0}Hz", freq)
+        }
+    }
+}
+
+impl Default for EqState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for EqState {
+    fn clone(&self) -> Self {
+        Self {
+            params: Arc::clone(&self.params),
+            config: self.config.clone(),
+            selected_band: self.selected_band,
+            expanded: self.expanded,
+        }
+    }
 }
 
 /// Group member state for UI.
@@ -300,6 +438,7 @@ impl Default for AppState {
             current_file: None,
             group: None,
             group_member_index: 0,
+            eq: EqState::default(),
             #[cfg(feature = "bluetooth")]
             bluetooth: BluetoothState::default(),
         }

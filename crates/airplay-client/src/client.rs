@@ -3,7 +3,8 @@
 use airplay_core::{Device, DeviceId, StreamConfig, error::Result};
 use airplay_core::error::{Error, RtspError, DiscoveryError};
 use airplay_discovery::{ServiceBrowser, Discovery};
-use airplay_audio::{AudioDecoder, LiveAudioDecoder, LiveFrameSender, LivePcmFrame};
+use airplay_audio::{AudioDecoder, LiveAudioDecoder, LiveFrameSender, LivePcmFrame, EqConfig, EqParams};
+use std::sync::Arc;
 use std::path::Path;
 use std::time::Duration;
 use crate::{Connection, DeviceGroup, PlaybackState, EventHandler, ClientEvent};
@@ -350,6 +351,41 @@ impl AirPlayClient {
         })?;
 
         connection.send_feedback().await
+    }
+
+    /// Set up the equalizer with shared parameters.
+    ///
+    /// The EQ will be applied to audio during streaming. Parameters can be
+    /// updated atomically from another thread (e.g., the UI).
+    ///
+    /// Must be called after `connect()` and before `play_file()` or `start_live_streaming()`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let config = EqConfig::five_band();
+    /// let params = Arc::new(EqParams::new(config.num_bands()));
+    ///
+    /// // Set bass boost
+    /// params.set_gain_db(0, 6.0);
+    ///
+    /// client.set_eq_params(config, params.clone()).await?;
+    /// client.play_file("song.mp3").await?;
+    ///
+    /// // Adjust EQ during playback
+    /// params.set_gain_db(4, -3.0);  // Reduce treble
+    /// ```
+    pub fn set_eq_params(&mut self, config: EqConfig, params: Arc<EqParams>) -> Result<()> {
+        let connection = self.connection.as_mut().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+
+        connection.set_eq_params(config, params);
+        Ok(())
+    }
+
+    /// Get a clone of the EQ params Arc if set.
+    pub fn eq_params(&self) -> Option<Arc<EqParams>> {
+        self.connection.as_ref().and_then(|c| c.eq_params())
     }
 
     /// Get current playback state.

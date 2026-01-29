@@ -3,6 +3,7 @@
 use airplay_core::{StreamConfig, error::Result};
 use crate::{AudioBuffer, AudioDecoder, RtpSender, LiveAudioDecoder};
 use crate::encoder::{create_encoder, AudioEncoder};
+use crate::eq::{EqConfig, EqParams, Equalizer};
 use airplay_timing::{Clock, ClockOffset, unix_to_ntp};
 use std::sync::{Arc, atomic::{AtomicU64, AtomicU8, Ordering}};
 use tokio::sync::{Mutex, watch};
@@ -320,6 +321,8 @@ struct StreamerInner {
     /// Live audio decoder for streaming from external sources (e.g., Bluetooth).
     live_decoder: Option<LiveAudioDecoder>,
     encoder: Option<Box<dyn AudioEncoder>>,
+    /// Audio equalizer for processing audio before encoding.
+    equalizer: Option<Equalizer>,
     /// Track whether first audio packet has been sent (requires marker bit)
     first_packet_sent: bool,
     /// Render delay in nanoseconds added to NTP timestamps in sync packets.
@@ -371,6 +374,7 @@ impl AudioStreamer {
                 decoder: None,
                 live_decoder: None,
                 encoder: None,
+                equalizer: None,
                 first_packet_sent: false,
                 render_delay_ns: 0,
             })),
@@ -396,6 +400,23 @@ impl AudioStreamer {
         let delay_ns = delay_ms as u64 * 1_000_000;
         self.inner.lock().await.render_delay_ns = delay_ns;
         tracing::info!("Render delay set to {}ms ({}ns)", delay_ms, delay_ns);
+    }
+
+    /// Set up the equalizer with shared parameters.
+    ///
+    /// The EQ will be initialized with the given configuration and parameters.
+    /// The parameters can be updated atomically from another thread (e.g., the UI).
+    pub async fn set_eq_params(&mut self, config: EqConfig, params: Arc<EqParams>) {
+        let mut inner = self.inner.lock().await;
+        let sample_rate = inner.config.audio_format.sample_rate.as_hz();
+        inner.equalizer = Some(Equalizer::new(config, params, sample_rate));
+        tracing::info!("Equalizer enabled with {} bands", inner.equalizer.as_ref().unwrap().config().num_bands());
+    }
+
+    /// Get a clone of the EQ params if the equalizer is set up.
+    pub async fn eq_params(&self) -> Option<Arc<EqParams>> {
+        let inner = self.inner.lock().await;
+        inner.equalizer.as_ref().map(|eq| Arc::clone(eq.params()))
     }
 
     /// Handle retransmit request from control channel.
@@ -691,6 +712,10 @@ impl AudioStreamer {
         if let Some(ref mut decoder) = inner.decoder {
             decoder.seek(position_samples)?;
         }
+        // Reset EQ filter state to avoid artifacts from previous audio
+        if let Some(ref mut eq) = inner.equalizer {
+            eq.reset();
+        }
         inner.current_timestamp = position_samples;
         self.timestamp_cache.store(position_samples, Ordering::Relaxed);
         Ok(())
@@ -880,13 +905,22 @@ async fn run_streamer(
                     );
                 }
 
+                // Process through equalizer if enabled
+                let samples_to_encode: Vec<i16> = if let Some(ref mut eq) = guard.equalizer {
+                    let mut samples = (*frame.samples).clone();
+                    eq.process(&mut samples);
+                    samples
+                } else {
+                    (*frame.samples).clone()
+                };
+
                 // Encode synchronously
                 let encode_start = Instant::now();
                 let encoder = guard
                     .encoder
                     .as_mut()
                     .ok_or_else(|| airplay_core::error::StreamingError::Encoding("Encoder missing".into()))?;
-                let packet = encoder.encode(&frame.samples)?;
+                let packet = encoder.encode(&samples_to_encode)?;
                 let encode_elapsed = encode_start.elapsed();
 
                 // Diagnostic: log encoded ALAC data and timing for first few packets

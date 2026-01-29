@@ -14,7 +14,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn, error, instrument};
 
-use airplay_client::{AirPlayClient, PlaybackState, ClientEvent, CallbackHandler};
+use airplay_client::{AirPlayClient, PlaybackState, ClientEvent, CallbackHandler, EqConfig};
 #[cfg(all(feature = "bluetooth", target_os = "linux"))]
 use airplay_client::{LiveFrameSender, LivePcmFrame};
 use airplay_core::{Device, StreamConfig};
@@ -277,6 +277,19 @@ impl App {
                 KeyCode::Right => Some(Action::SeekForward(10.0)),
                 KeyCode::Char('+') | KeyCode::Char('=') => Some(Action::VolumeUp),
                 KeyCode::Char('-') => Some(Action::VolumeDown),
+                // EQ controls - intuitive keys
+                KeyCode::Char('e') => Some(Action::EqToggleExpanded),
+                KeyCode::Char('b') => Some(Action::EqToggleBypass),
+                KeyCode::Char('r') => Some(Action::EqReset),
+                // Band selection: , and . (like < > without shift)
+                KeyCode::Char(',') => Some(Action::EqSelectPrevBand),
+                KeyCode::Char('.') => Some(Action::EqSelectNextBand),
+                // Gain adjustment: [ and ] (down/up like volume)
+                KeyCode::Char('[') => Some(Action::EqDecreaseGain),
+                KeyCode::Char(']') => Some(Action::EqIncreaseGain),
+                // Also support < > for gain (shifted , .)
+                KeyCode::Char('<') => Some(Action::EqDecreaseGain),
+                KeyCode::Char('>') => Some(Action::EqIncreaseGain),
                 _ => None,
             },
             View::Group => match key.code {
@@ -565,6 +578,36 @@ impl App {
             Action::ClearStatus => {
                 self.state.status = None;
             }
+            // Equalizer actions
+            Action::EqSelectPrevBand => {
+                self.state.eq.select_prev_band();
+            }
+            Action::EqSelectNextBand => {
+                self.state.eq.select_next_band();
+            }
+            Action::EqIncreaseGain => {
+                self.state.eq.increase_gain();
+            }
+            Action::EqDecreaseGain => {
+                self.state.eq.decrease_gain();
+            }
+            Action::EqToggleBypass => {
+                self.state.eq.toggle_bypass();
+                let status = if self.state.eq.is_bypassed() {
+                    "EQ bypassed"
+                } else {
+                    "EQ enabled"
+                };
+                self.state.set_status(StatusMessage::info(status));
+            }
+            Action::EqToggleExpanded => {
+                self.state.eq.toggle_expanded();
+            }
+            Action::EqReset => {
+                self.state.eq.reset();
+                self.state.set_status(StatusMessage::info("EQ reset to flat"));
+            }
+
             Action::Tick => {
                 self.state.clear_expired_status();
 
@@ -938,6 +981,12 @@ impl App {
                             let stream_result = {
                                 let mut client = self.client.lock().await;
                                 client.set_render_delay_ms(500);
+                                // Set up EQ for live streaming
+                                let eq_config = self.state.eq.config.clone();
+                                let eq_params = Arc::clone(&self.state.eq.params);
+                                if let Err(e) = client.set_eq_params(eq_config, eq_params) {
+                                    warn!("Failed to set EQ params for live streaming: {}", e);
+                                }
                                 client.start_live_streaming_with_decoder(decoder).await
                             };
 
@@ -1217,6 +1266,10 @@ impl App {
         )));
         self.state.current_file = Some(path.display().to_string());
 
+        // Get EQ params to pass to the streamer
+        let eq_config = self.state.eq.config.clone();
+        let eq_params = Arc::clone(&self.state.eq.params);
+
         let tx = self.action_tx.clone();
         let client = self.client.clone();
         let path_clone = path.clone();
@@ -1225,6 +1278,12 @@ impl App {
             debug!("Calling client.play_file with 30 second timeout");
             let play_result = tokio::time::timeout(Duration::from_secs(30), async {
                 let mut client = client.lock().await;
+                // Set up EQ before starting playback
+                if let Err(e) = client.set_eq_params(eq_config, eq_params) {
+                    warn!("Failed to set EQ params: {}", e);
+                } else {
+                    info!("EQ params configured for playback");
+                }
                 client.play_file(&path_clone).await
             })
             .await;

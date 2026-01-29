@@ -83,6 +83,28 @@ pub fn render_help(frame: &mut Frame, _state: &AppState) {
             Span::raw("Volume up / down"),
         ]),
         Line::from(""),
+        Line::from(Span::styled("Equalizer (Player View)", Style::default().fg(Color::Yellow))),
+        Line::from(vec![
+            Span::styled("  e        ", Style::default().fg(Color::Green)),
+            Span::raw("Show / hide EQ panel"),
+        ]),
+        Line::from(vec![
+            Span::styled("  b        ", Style::default().fg(Color::Green)),
+            Span::raw("Bypass EQ (on/off)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  , / .    ", Style::default().fg(Color::Green)),
+            Span::raw("Select prev / next band"),
+        ]),
+        Line::from(vec![
+            Span::styled("  [ / ]    ", Style::default().fg(Color::Green)),
+            Span::raw("Decrease / increase gain"),
+        ]),
+        Line::from(vec![
+            Span::styled("  r        ", Style::default().fg(Color::Green)),
+            Span::raw("Reset EQ to flat"),
+        ]),
+        Line::from(""),
         Line::from(Span::styled("Group View", Style::default().fg(Color::Yellow))),
         Line::from(vec![
             Span::styled("  g        ", Style::default().fg(Color::Green)),

@@ -4,11 +4,13 @@ use airplay_core::{Device, StreamConfig, error::Result};
 use airplay_core::error::{Error as CoreError, RtspError};
 use airplay_core::features::AuthMethod;
 use airplay_rtsp::{RtspConnection, RtspSession, SessionState, RtspRequest};
-use airplay_pairing::PairingSession;
+use airplay_pairing::{PairingSession, PairVerify, ControllerIdentity};
 use airplay_crypto::ed25519::IdentityKeyPair;
+use std::path::PathBuf;
+use std::fs;
 // Timing imports reserved for future use
 // use airplay_timing::{TimingProtocol, NtpTimingClient, PtpClient};
-use airplay_audio::{AudioStreamer, AudioDecoder, LiveAudioDecoder, RtpSender, RtpReceiver};
+use airplay_audio::{AudioStreamer, AudioDecoder, LiveAudioDecoder, RtpSender, RtpReceiver, EqConfig, EqParams};
 use std::sync::Arc;
 use airplay_audio::cipher::ChaChaPacketCipher;
 use airplay_crypto::chacha::ControlCipher;
@@ -36,6 +38,63 @@ fn generate_device_id() -> String {
         rng.gen::<u8>(),
         rng.gen::<u8>()
     )
+}
+
+/// Persisted sender identity for pair-verify after initial pair-setup.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistentIdentity {
+    device_id: String,
+    dacp_id: String,
+    ed25519_secret: Vec<u8>,
+    controller_id: String,
+    server_ltpk: Option<Vec<u8>>,
+    server_identifier: Option<String>,
+    pair_verify_id: String,
+}
+
+impl PersistentIdentity {
+    /// Find identity file for a target device.
+    fn identity_file_for(target_device_id: &str) -> PathBuf {
+        let suffix = target_device_id.replace(":", "").to_lowercase();
+        PathBuf::from(format!(".airplay_sender_identity_{}.json", suffix))
+    }
+
+    /// Load identity for a target device if it exists.
+    fn load_for_device(target_device_id: &str) -> Option<Self> {
+        let path = Self::identity_file_for(target_device_id);
+        if !path.exists() {
+            return None;
+        }
+        let data = fs::read_to_string(&path).ok()?;
+        let identity: Self = serde_json::from_str(&data).ok()?;
+        // Verify we have the essential fields for pair-verify
+        if identity.ed25519_secret.len() != 32 {
+            return None;
+        }
+        info!("Loaded persisted identity from {}", path.display());
+        Some(identity)
+    }
+
+    /// Convert to ControllerIdentity for pair-verify.
+    fn to_controller(&self) -> Option<ControllerIdentity> {
+        if self.ed25519_secret.len() != 32 {
+            return None;
+        }
+        let seed: [u8; 32] = self.ed25519_secret.clone().try_into().ok()?;
+        let keypair = IdentityKeyPair::from_seed(&seed);
+        Some(ControllerIdentity::with_id(keypair, self.controller_id.clone()))
+    }
+
+    /// Get server LTPK as array if available.
+    fn server_ltpk_array(&self) -> Option<[u8; 32]> {
+        let ltpk = self.server_ltpk.as_ref()?;
+        if ltpk.len() != 32 {
+            return None;
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(ltpk);
+        Some(arr)
+    }
 }
 
 fn stream_key_from_shared_secret(shared_secret: &SharedSecret) -> Result<[u8; 32]> {
@@ -114,6 +173,10 @@ pub struct Connection {
     events_stream: Option<TcpStream>,
     /// Render delay in ms added to NTP timestamps for extra retransmit headroom.
     render_delay_ms: u32,
+    /// Equalizer configuration (set before streaming).
+    eq_config: Option<EqConfig>,
+    /// Shared equalizer parameters for real-time control.
+    eq_params: Option<Arc<EqParams>>,
 }
 
 impl Connection {
@@ -230,6 +293,174 @@ impl Connection {
             control_task: None,
             events_stream: None,
             render_delay_ms: 0,
+            eq_config: None,
+            eq_params: None,
+        })
+    }
+
+    /// Create connection using persisted identity (pair-verify) if available.
+    ///
+    /// This method first checks for a saved identity from a previous pair-setup.
+    /// If found, it uses pair-verify (M1-M4) which is faster and doesn't require
+    /// a PIN. If no identity exists, falls back to transient pairing with the
+    /// provided PIN.
+    ///
+    /// Use this for devices like Apple TV that require initial pair-setup with
+    /// a one-time PIN from `/pair-pin-start`, but then allow pair-verify for
+    /// subsequent connections.
+    pub async fn connect_auto(device: Device, config: StreamConfig, fallback_pin: &str) -> Result<Self> {
+        // Check if we have a persisted identity for this device
+        let target_device_id = device.id.to_mac_string();
+        if let Some(persistent_id) = PersistentIdentity::load_for_device(&target_device_id) {
+            info!("Found persisted identity for {}, attempting pair-verify", target_device_id);
+            match Self::connect_with_pair_verify(device.clone(), config.clone(), &persistent_id).await {
+                Ok(conn) => {
+                    info!("Pair-verify successful");
+                    return Ok(conn);
+                }
+                Err(e) => {
+                    warn!("Pair-verify failed: {}, falling back to transient pairing", e);
+                }
+            }
+        }
+
+        // Fall back to transient pairing
+        Self::connect_with_pin(device, config, fallback_pin).await
+    }
+
+    /// Create connection using pair-verify with a persisted identity.
+    async fn connect_with_pair_verify(
+        device: Device,
+        config: StreamConfig,
+        persistent_id: &PersistentIdentity,
+    ) -> Result<Self> {
+        // Use the persisted client device ID for consistency
+        let client_device_id = persistent_id.device_id.clone();
+
+        // Reconstruct the controller identity
+        let controller = persistent_id.to_controller().ok_or_else(|| {
+            RtspError::SetupFailed("Invalid persisted identity".into())
+        })?;
+        let identity = controller.keypair().clone();
+
+        // 1. TCP connect
+        let ip_addr = select_best_address(&device.addresses)
+            .ok_or_else(|| RtspError::ConnectionRefused)?;
+        let addr = SocketAddr::new(*ip_addr, device.port);
+        info!("Connecting to {} at {} (pair-verify)", device.name, addr);
+
+        let mut rtsp = RtspConnection::new(addr);
+        rtsp.connect().await?;
+
+        // 2. Create session
+        let mut session = RtspSession::new(device.clone(), config.clone());
+        session.set_client_device_id(client_device_id.clone());
+        session.set_connected()?;
+        session.set_request_host(ip_addr.to_string());
+
+        let client_instance = client_device_id.replace(":", "");
+        rtsp.add_session_header("User-Agent", "AirPlay/745.83");
+        rtsp.add_session_header("X-Apple-Client-Name", "Rust AirPlay Sender");
+        rtsp.add_session_header("X-Apple-Device-ID", client_device_id.clone());
+        rtsp.add_session_header("DACP-ID", client_instance.clone());
+        rtsp.add_session_header("Client-Instance", client_instance);
+        rtsp.add_session_header("Active-Remote", "1234567890");
+
+        // 3. GET /info (required before pairing)
+        let info_req = RtspRequest::get_info();
+        let _info_resp = rtsp.send(info_req).await?;
+
+        // 4. Pair-verify (M1-M4 flow with HKP=3)
+        let mut pair_verify = PairVerify::new_with_controller(&controller);
+
+        // Set server LTPK if available (for signature verification)
+        if let Some(ltpk) = persistent_id.server_ltpk_array() {
+            pair_verify.set_server_ltpk(ltpk);
+        }
+
+        // M1: Send our ECDH public key
+        let m1 = pair_verify.generate_m1().map_err(|e| {
+            RtspError::SetupFailed(format!("Pair-verify M1 generation failed: {}", e))
+        })?;
+        debug!("Pair-verify M1: {} bytes", m1.len());
+
+        let pair_verify_req = RtspRequest::pair_verify(m1, 3);
+        let m2_resp = rtsp.send(pair_verify_req).await?;
+
+        let m2_body = m2_resp.body.as_deref().unwrap_or(&[]);
+        debug!("Pair-verify M2: {} bytes", m2_body.len());
+
+        // Process M2
+        pair_verify.process_m2(m2_body).map_err(|e| {
+            RtspError::SetupFailed(format!("Pair-verify M2 processing failed: {}", e))
+        })?;
+
+        // M3: Send our signature
+        let m3 = pair_verify.generate_m3().map_err(|e| {
+            RtspError::SetupFailed(format!("Pair-verify M3 generation failed: {}", e))
+        })?;
+        debug!("Pair-verify M3: {} bytes", m3.len());
+
+        let pair_verify_req = RtspRequest::pair_verify(m3, 3);
+        let m4_resp = rtsp.send(pair_verify_req).await?;
+
+        let m4_body = m4_resp.body.as_deref().unwrap_or(&[]);
+        debug!("Pair-verify M4: {} bytes", m4_body.len());
+
+        // Process M4 and get session keys
+        let session_keys = pair_verify.process_m4(m4_body).map_err(|e| {
+            RtspError::SetupFailed(format!("Pair-verify M4 processing failed: {}", e))
+        })?;
+
+        info!("Pair-verify complete, establishing encrypted session");
+
+        let cipher = ControlCipher::new(
+            *session_keys.write_key.as_bytes(),
+            *session_keys.read_key.as_bytes(),
+        );
+        rtsp.set_cipher(cipher);
+
+        // Test encrypted communication
+        match rtsp.send(RtspRequest::options()).await {
+            Ok(resp) => {
+                if let Some(public) = resp.header("Public") {
+                    info!("OPTIONS supported methods: {}", public);
+                } else {
+                    info!("OPTIONS returned {} (no Public header)", resp.status_code);
+                }
+            }
+            Err(err) => {
+                warn!("Encrypted OPTIONS request failed: {}", err);
+            }
+        }
+
+        session.set_paired()?;
+
+        // Create a dummy pairing session to satisfy the struct
+        let auth_method = AuthMethod::HomeKitTransient;
+        let pairing = PairingSession::with_identity(auth_method, identity);
+
+        Ok(Self {
+            device,
+            rtsp,
+            session,
+            pairing: Some(pairing),
+            streamer: None,
+            playback_state: PlaybackState::Stopped,
+            volume: 1.0,
+            stream_config: config,
+            timing_offset: None,
+            timing_tx: None,
+            timing_task: None,
+            timing_server: None,
+            ptp_master: None,
+            ptp_master_sync_task: None,
+            control_receiver: None,
+            control_task: None,
+            events_stream: None,
+            render_delay_ms: 0,
+            eq_config: None,
+            eq_params: None,
         })
     }
 
@@ -676,6 +907,11 @@ impl Connection {
         // As PTP master, our clock is the reference - offset is always 0.
         // No watch::Receiver needed (timing_offset was set to default in setup).
 
+        // Set up equalizer if configured
+        if let (Some(config), Some(params)) = (self.eq_config.take(), self.eq_params.clone()) {
+            streamer.set_eq_params(config, params).await;
+        }
+
         // FLUSH before streaming — tells receiver to clear buffers and expect audio
         // starting at the given seq/rtptime.
         let flush_req = RtspRequest::flush_with_info(
@@ -862,6 +1098,11 @@ impl Connection {
             streamer.set_timing_updates(tx.subscribe()).await;
         }
 
+        // Set up equalizer if configured
+        if let (Some(config), Some(params)) = (self.eq_config.take(), self.eq_params.clone()) {
+            streamer.set_eq_params(config, params).await;
+        }
+
         // FLUSH before streaming
         let flush_req = RtspRequest::flush_with_info(
             self.session.request_uri(),
@@ -1025,6 +1266,22 @@ impl Connection {
     /// Must be called before `start_streaming()`. Typical values: 100-500ms.
     pub fn set_render_delay_ms(&mut self, delay_ms: u32) {
         self.render_delay_ms = delay_ms;
+    }
+
+    /// Set up the equalizer with shared parameters.
+    ///
+    /// The EQ will be applied to audio during streaming. Parameters can be
+    /// updated atomically from another thread (e.g., the UI).
+    ///
+    /// Must be called before `start_streaming()` or `start_streaming_live()`.
+    pub fn set_eq_params(&mut self, config: EqConfig, params: Arc<EqParams>) {
+        self.eq_config = Some(config);
+        self.eq_params = Some(params);
+    }
+
+    /// Get a clone of the EQ params Arc if set.
+    pub fn eq_params(&self) -> Option<Arc<EqParams>> {
+        self.eq_params.clone()
     }
 
     /// Set volume.
