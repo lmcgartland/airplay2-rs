@@ -297,11 +297,19 @@ impl AudioDecoder {
             collected_samples.truncate(target_samples);
         }
 
+        // Scale timestamp from source sample rate to target sample rate so it
+        // matches the returned samples (both are now in target rate units).
+        let scaled_timestamp = if source_rate != target_rate {
+            (self.position_samples as f64 * target_rate as f64 / source_rate as f64) as u64
+        } else {
+            self.position_samples
+        };
+
         Ok(Some(DecodedFrame {
             samples: collected_samples,
             channels: target_format.channels,
             sample_rate: target_rate,
-            timestamp: self.position_samples,
+            timestamp: scaled_timestamp,
         }))
     }
 

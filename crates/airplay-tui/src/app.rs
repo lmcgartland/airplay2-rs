@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn, error, instrument};
 
 use airplay_client::{AirPlayClient, PlaybackState, ClientEvent, CallbackHandler};
-use airplay_core::Device;
+use airplay_core::{Device, StreamConfig};
 
 use crate::action::Action;
 use crate::audio_info;
@@ -49,8 +49,9 @@ impl App {
         // Create client with event handler that dispatches to our action channel
         let tx = action_tx.clone();
         debug!("Creating AirPlay client");
+        // Use realtime mode with NTP timing for reliable playback
         let client = AirPlayClient::with_config(
-            Default::default(),
+            StreamConfig::airplay1_realtime(),
             Some(Box::new(CallbackHandler::new(move |event| {
                 let action = match event {
                     ClientEvent::DeviceDiscovered(_device) => {

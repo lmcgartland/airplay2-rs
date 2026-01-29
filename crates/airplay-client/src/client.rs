@@ -15,6 +15,9 @@ pub struct AirPlayClient {
     group: Option<DeviceGroup>,
     event_handler: Option<Box<dyn EventHandler>>,
     stream_config: StreamConfig,
+    /// Render delay in ms added to NTP timestamps for extra retransmit headroom.
+    /// Default: 200ms for reliable playback over WiFi.
+    render_delay_ms: u32,
 }
 
 impl AirPlayClient {
@@ -26,6 +29,7 @@ impl AirPlayClient {
             group: None,
             event_handler: None,
             stream_config: StreamConfig::default(),
+            render_delay_ms: 200, // 200ms default for reliable playback over WiFi
         })
     }
 
@@ -37,12 +41,25 @@ impl AirPlayClient {
             group: None,
             event_handler,
             stream_config: config,
+            render_delay_ms: 200, // 200ms default for reliable playback over WiFi
         })
     }
 
     /// Set event handler.
     pub fn set_event_handler(&mut self, handler: impl EventHandler + 'static) {
         self.event_handler = Some(Box::new(handler));
+    }
+
+    /// Set render delay in milliseconds.
+    ///
+    /// Shifts NTP timestamps in sync packets into the future, telling the
+    /// receiver to buffer audio longer before rendering. This gives more
+    /// headroom for retransmit recovery of lost packets over lossy WiFi.
+    ///
+    /// Default is 200ms. Typical values: 100-500ms.
+    /// Must be called before `connect()`.
+    pub fn set_render_delay_ms(&mut self, delay_ms: u32) {
+        self.render_delay_ms = delay_ms;
     }
 
     /// Emit an event if handler is set.
@@ -69,15 +86,14 @@ impl AirPlayClient {
             self.disconnect().await?;
         }
 
-        let stream_config = if device.features.supports_buffered_audio() {
-            // Use real-time ALAC + NTP (matches owntone behavior for HomePod)
-            StreamConfig::airplay1_realtime()
-        } else {
-            self.stream_config.clone()
-        };
+        // Use the user-provided stream config (don't override based on device features)
+        let stream_config = self.stream_config.clone();
 
         // Establish connection
         let mut connection = Connection::connect(device.clone(), stream_config).await?;
+
+        // Set render delay for retransmit headroom
+        connection.set_render_delay_ms(self.render_delay_ms);
 
         // Complete RTSP SETUP handshake (CRITICAL - required before streaming)
         connection.setup().await?;
@@ -96,15 +112,14 @@ impl AirPlayClient {
             self.disconnect().await?;
         }
 
-        let stream_config = if device.features.supports_buffered_audio() {
-            // Use real-time ALAC + NTP (matches owntone behavior for HomePod)
-            StreamConfig::airplay1_realtime()
-        } else {
-            self.stream_config.clone()
-        };
+        // Use the user-provided stream config (don't override based on device features)
+        let stream_config = self.stream_config.clone();
 
         // Establish connection
         let mut connection = Connection::connect_with_pin(device.clone(), stream_config, pin).await?;
+
+        // Set render delay for retransmit headroom
+        connection.set_render_delay_ms(self.render_delay_ms);
 
         // Complete RTSP SETUP handshake (CRITICAL - required before streaming)
         connection.setup().await?;

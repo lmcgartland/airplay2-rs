@@ -9,6 +9,8 @@ pub struct ClientBuilder {
     event_handler: Option<Box<dyn EventHandler>>,
     auto_reconnect: bool,
     buffer_duration_ms: u32,
+    /// Render delay in ms for retransmit headroom.
+    render_delay_ms: u32,
 }
 
 impl ClientBuilder {
@@ -19,6 +21,7 @@ impl ClientBuilder {
             event_handler: None,
             auto_reconnect: false,
             buffer_duration_ms: 2000,
+            render_delay_ms: 200, // 200ms default for reliable playback over WiFi
         }
     }
 
@@ -34,9 +37,12 @@ impl ClientBuilder {
         self
     }
 
-    /// Use AirPlay 2 buffered streaming.
+    /// Use AirPlay 2 with NTP realtime streaming.
+    ///
+    /// Note: Uses realtime mode with NTP timing which is reliable.
+    /// Buffered mode and PTP timing are currently not working with HomePod devices.
     pub fn airplay2(mut self) -> Self {
-        self.stream_config = StreamConfig::airplay2_buffered();
+        self.stream_config = StreamConfig::airplay1_realtime();
         self
     }
 
@@ -64,9 +70,23 @@ impl ClientBuilder {
         self
     }
 
+    /// Set render delay in milliseconds.
+    ///
+    /// Shifts NTP timestamps in sync packets into the future, telling the
+    /// receiver to buffer audio longer before rendering. This gives more
+    /// headroom for retransmit recovery of lost packets over lossy WiFi.
+    ///
+    /// Default is 200ms. Typical values: 100-500ms.
+    pub fn render_delay_ms(mut self, ms: u32) -> Self {
+        self.render_delay_ms = ms;
+        self
+    }
+
     /// Build the client.
     pub fn build(self) -> Result<AirPlayClient> {
-        AirPlayClient::with_config(self.stream_config, self.event_handler)
+        let mut client = AirPlayClient::with_config(self.stream_config, self.event_handler)?;
+        client.set_render_delay_ms(self.render_delay_ms);
+        Ok(client)
     }
 }
 
@@ -100,10 +120,10 @@ mod tests {
         }
 
         #[test]
-        fn airplay2_sets_buffered_config() {
+        fn airplay2_sets_realtime_ntp_config() {
             let builder = ClientBuilder::new().airplay2();
-            assert_eq!(builder.stream_config.stream_type, StreamType::Buffered);
-            assert_eq!(builder.stream_config.timing_protocol, TimingProtocol::Ptp);
+            assert_eq!(builder.stream_config.stream_type, StreamType::Realtime);
+            assert_eq!(builder.stream_config.timing_protocol, TimingProtocol::Ntp);
         }
 
         #[test]
