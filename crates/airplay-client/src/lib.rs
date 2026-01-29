@@ -53,3 +53,6 @@ pub use events::{ClientEvent, EventHandler, NoOpHandler, CallbackHandler};
 // Re-export commonly used types
 pub use airplay_core::{Device, DeviceId, AudioFormat, StreamConfig, Error, Result};
 pub use airplay_discovery::Discovery;
+
+// Live streaming types for external sources (e.g., Bluetooth audio)
+pub use airplay_audio::{LiveAudioDecoder, LiveFrameSender, LivePcmFrame};

@@ -8,7 +8,7 @@ use airplay_pairing::PairingSession;
 use airplay_crypto::ed25519::IdentityKeyPair;
 // Timing imports reserved for future use
 // use airplay_timing::{TimingProtocol, NtpTimingClient, PtpClient};
-use airplay_audio::{AudioStreamer, AudioDecoder, RtpSender, RtpReceiver};
+use airplay_audio::{AudioStreamer, AudioDecoder, LiveAudioDecoder, RtpSender, RtpReceiver};
 use std::sync::Arc;
 use airplay_audio::cipher::ChaChaPacketCipher;
 use airplay_crypto::chacha::ControlCipher;
@@ -803,6 +803,150 @@ impl Connection {
         if self.control_task.is_some() {
             tracing::info!("Started control channel polling for retransmit requests");
         }
+
+        Ok(())
+    }
+
+    /// Start audio streaming from a live source (e.g., Bluetooth capture).
+    ///
+    /// This is similar to `start_streaming()` but uses a `LiveAudioDecoder` that
+    /// receives PCM frames from a channel, enabling streaming from external sources.
+    pub async fn start_streaming_live(&mut self, live_decoder: LiveAudioDecoder) -> Result<()> {
+        // Ensure setup is complete
+        if self.session.state() != SessionState::Ready {
+            self.setup().await?;
+        }
+
+        // Configure RTP sender
+        let ports = self.session.ports()
+            .ok_or_else(|| RtspError::SetupFailed("Missing ports from SETUP".into()))?;
+        tracing::debug!(
+            "Session ports: data={}, control={}, timing={}, event={}",
+            ports.data_port, ports.control_port, ports.timing_port, ports.event_port
+        );
+        let dest_addr = select_best_address(&self.device.addresses)
+            .ok_or_else(|| RtspError::ConnectionRefused)?;
+        let dest = SocketAddr::new(*dest_addr, ports.data_port);
+        let control_dest = SocketAddr::new(*dest_addr, ports.control_port);
+        let mut sender = RtpSender::new(dest, rand::random());
+        sender.set_control_dest(control_dest);
+        sender.bind(0)?;
+
+        // Give the sender a clone of our control socket
+        if let Some(ref control_rx) = self.control_receiver {
+            if let Ok(Some(ctrl_sock)) = control_rx.try_clone_socket() {
+                let ctrl_port = ctrl_sock.local_addr().map(|a| a.port()).unwrap_or(0);
+                sender.set_control_socket(ctrl_sock);
+                tracing::info!("Sync packets will be sent from control port {}", ctrl_port);
+            }
+        }
+
+        tracing::info!("RTP sender bound for live streaming, data: {}, control: {}", dest, control_dest);
+
+        // Enable audio encryption
+        let stream_key = *self.session.stream_key();
+        let audio_cipher = AudioCipher::new(stream_key);
+        sender.set_cipher(Box::new(ChaChaPacketCipher::new(audio_cipher)));
+        info!("Live streaming: ChaCha20-Poly1305 audio encryption enabled");
+
+        // Start streamer
+        let mut streamer = AudioStreamer::new(self.stream_config.clone());
+        streamer.set_rtp_sender(sender).await;
+        if self.render_delay_ms > 0 {
+            streamer.set_render_delay_ms(self.render_delay_ms).await;
+        }
+        if let Some(offset) = self.timing_offset {
+            streamer.set_timing_offset(offset).await;
+        }
+        if let Some(ref tx) = self.timing_tx {
+            streamer.set_timing_updates(tx.subscribe()).await;
+        }
+
+        // FLUSH before streaming
+        let flush_req = RtspRequest::flush_with_info(
+            self.session.request_uri(),
+            0,
+            0,
+        );
+        if let Err(e) = self.rtsp.send(flush_req).await {
+            tracing::warn!("FLUSH failed (continuing anyway): {}", e);
+        } else {
+            tracing::info!("FLUSH sent before live streaming");
+        }
+
+        // Start live streaming
+        streamer.start_live(live_decoder).await?;
+
+        self.session.start_playing()?;
+
+        // Set volume
+        tracing::info!("Sending SET_PARAMETER volume");
+        if let Err(e) = self.set_volume(self.volume).await {
+            tracing::warn!("Failed to set volume: {}", e);
+        }
+
+        // Spawn control channel for retransmit handling
+        let control_task = if let Some(ref control_rx) = self.control_receiver {
+            use airplay_audio::RetransmitRequest;
+            let control_rx_clone = Arc::clone(control_rx);
+            let streamer_clone = streamer.clone();
+            let rt_handle = tokio::runtime::Handle::current();
+
+            Some(tokio::task::spawn_blocking(move || {
+                tracing::debug!("Control channel thread started for live streaming (5ms poll)");
+                loop {
+                    match control_rx_clone.recv_raw_timeout(std::time::Duration::from_millis(5)) {
+                        Ok(Some((data, _addr))) => {
+                            if data.len() < 4 {
+                                continue;
+                            }
+
+                            let payload_type = data[1] & 0x7F;
+
+                            if payload_type == 85 {
+                                let request = if data.len() == 8 {
+                                    let first_sequence = u16::from_be_bytes([data[4], data[5]]);
+                                    let count = u16::from_be_bytes([data[6], data[7]]);
+                                    Some(RetransmitRequest { first_sequence, count })
+                                } else if data.len() >= 12 {
+                                    RetransmitRequest::parse(&data).ok()
+                                } else {
+                                    None
+                                };
+
+                                if let Some(request) = request {
+                                    match rt_handle.block_on(streamer_clone.handle_retransmit(&request)) {
+                                        Ok(retransmitted) => {
+                                            if retransmitted > 0 {
+                                                tracing::debug!(
+                                                    "Retransmitted {} packets starting from seq {}",
+                                                    retransmitted, request.first_sequence
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Retransmit failed: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::trace!("Control channel recv error: {}", e);
+                        }
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
+        self.streamer = Some(streamer);
+        self.control_task = control_task;
+        self.playback_state = PlaybackState::Playing;
+
+        tracing::info!("Live audio streaming started");
 
         Ok(())
     }

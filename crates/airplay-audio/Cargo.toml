@@ -8,6 +8,7 @@ description = "Audio encoding and RTP streaming for AirPlay 2"
 airplay-core = { path = "../airplay-core" }
 airplay-crypto = { path = "../airplay-crypto" }
 airplay-timing = { path = "../airplay-timing" }
+airplay-resampler = { path = "../airplay-resampler" }
 tokio.workspace = true
 futures.workspace = true
 async-trait.workspace = true

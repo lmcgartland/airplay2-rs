@@ -10,6 +10,10 @@ description = "Terminal user interface for AirPlay 2 audio streaming"
 name = "airplay-tui"
 path = "src/main.rs"
 
+[features]
+default = []
+bluetooth = ["airplay-bluetooth"]
+
 [dependencies]
 airplay-client = { path = "../airplay-client" }
 airplay-core = { path = "../airplay-core" }
@@ -35,3 +39,7 @@ symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender = "0.2"
+
+# Optional Bluetooth support (Linux only)
+[target.'cfg(target_os = "linux")'.dependencies]
+airplay-bluetooth = { path = "../airplay-bluetooth", optional = true }

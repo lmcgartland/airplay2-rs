@@ -5,12 +5,16 @@ mod browser;
 mod player;
 mod group;
 mod help;
+#[cfg(feature = "bluetooth")]
+mod bluetooth;
 
 pub use devices::render_devices;
 pub use browser::render_browser;
 pub use player::render_player;
 pub use group::render_group;
 pub use help::render_help;
+#[cfg(feature = "bluetooth")]
+pub use bluetooth::render_bluetooth;
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -46,6 +50,8 @@ pub fn render(frame: &mut Frame, state: &AppState, browser: &FileBrowser) {
         View::Browser => render_browser(frame, chunks[1], browser),
         View::Player => render_player(frame, chunks[1], state),
         View::Group => render_group(frame, chunks[1], state),
+        #[cfg(feature = "bluetooth")]
+        View::Bluetooth => render_bluetooth(frame, chunks[1], state),
     }
 
     // Render footer with status
@@ -59,7 +65,7 @@ pub fn render(frame: &mut Frame, state: &AppState, browser: &FileBrowser) {
 
 /// Render the header with tab navigation.
 fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
-    let titles: Vec<Line> = [View::Devices, View::Browser, View::Player, View::Group]
+    let titles: Vec<Line> = View::all()
         .iter()
         .map(|v| {
             let style = if *v == state.view {
@@ -78,12 +84,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
                 .title(" AirPlay TUI ")
                 .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         )
-        .select(match state.view {
-            View::Devices => 0,
-            View::Browser => 1,
-            View::Player => 2,
-            View::Group => 3,
-        })
+        .select(state.view.index())
         .style(Style::default())
         .highlight_style(Style::default().fg(Color::Cyan));
 
@@ -106,6 +107,8 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
             View::Browser => "Enter: Select  Esc: Back  Tab: Next view  ?: Help",
             View::Player => "Space: Play/Pause  s: Stop  +/-: Volume  Tab: Next view",
             View::Group => "a: Add  d: Remove  Enter: Select  Tab: Next view",
+            #[cfg(feature = "bluetooth")]
+            View::Bluetooth => "s: Scan  p: Pair  c: Connect  d: Disconnect  u: Use as source",
         };
         Span::styled(hints, Style::default().fg(Color::DarkGray))
     };

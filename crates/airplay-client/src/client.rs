@@ -3,7 +3,7 @@
 use airplay_core::{Device, DeviceId, StreamConfig, error::Result};
 use airplay_core::error::{Error, RtspError, DiscoveryError};
 use airplay_discovery::{ServiceBrowser, Discovery};
-use airplay_audio::AudioDecoder;
+use airplay_audio::{AudioDecoder, LiveAudioDecoder, LiveFrameSender, LivePcmFrame};
 use std::path::Path;
 use std::time::Duration;
 use crate::{Connection, DeviceGroup, PlaybackState, EventHandler, ClientEvent};
@@ -170,16 +170,92 @@ impl AirPlayClient {
         Ok(())
     }
 
-    /// Play audio from raw PCM samples.
+    /// Play audio from raw PCM samples (one-shot).
     pub async fn play_pcm(&mut self, _samples: &[i16], _sample_rate: u32, _channels: u8) -> Result<()> {
         let _connection = self.connection.as_mut().ok_or_else(|| {
             Error::Rtsp(RtspError::NoSession)
         })?;
 
-        // TODO: PCM streaming path not implemented yet
+        // TODO: One-shot PCM streaming path not implemented yet
+        // For streaming, use start_live_streaming() instead
         Err(Error::Streaming(airplay_core::error::StreamingError::InvalidFormat(
-            "PCM streaming not implemented".into(),
+            "One-shot PCM streaming not implemented. Use start_live_streaming() for live sources.".into(),
         )))
+    }
+
+    /// Start live audio streaming from an external source (e.g., Bluetooth).
+    ///
+    /// Returns a `LiveFrameSender` that can be used to push PCM frames to the
+    /// AirPlay stream. The stream will continue until stopped or the sender is dropped.
+    ///
+    /// # Arguments
+    /// * `sample_rate` - Sample rate of the source audio in Hz (e.g., 44100)
+    /// * `channels` - Number of audio channels (typically 2 for stereo)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let sender = client.start_live_streaming(44100, 2).await?;
+    ///
+    /// // Push frames in a loop
+    /// loop {
+    ///     let frame = LivePcmFrame {
+    ///         samples: captured_audio,
+    ///         channels: 2,
+    ///         sample_rate: 44100,
+    ///     };
+    ///     sender.try_send(frame);
+    /// }
+    /// ```
+    pub async fn start_live_streaming(&mut self, sample_rate: u32, channels: u8) -> Result<LiveFrameSender> {
+        let connection = self.connection.as_mut().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+
+        // Create live decoder and sender pair
+        // Capacity of 16 frames provides ~350ms buffer at 352 frames/packet, 44.1kHz
+        let (sender, decoder) = LiveAudioDecoder::create_pair(sample_rate, channels, 16);
+
+        // Start live streaming
+        connection.start_streaming_live(decoder).await?;
+
+        self.emit_event(ClientEvent::PlaybackStateChanged(PlaybackState::Playing)).await;
+
+        Ok(sender)
+    }
+
+    /// Start live audio streaming with an existing decoder.
+    ///
+    /// This allows the caller to create the sender/decoder pair first, pre-fill
+    /// the channel with audio data, and then start streaming. This avoids startup
+    /// artifacts from empty buffers.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Create sender/decoder pair with larger buffer
+    /// let (sender, decoder) = LiveAudioDecoder::create_pair(44100, 2, 64);
+    ///
+    /// // Start capture thread that sends frames to sender
+    /// std::thread::spawn(move || {
+    ///     loop { sender.try_send(frame); }
+    /// });
+    ///
+    /// // Wait for channel to fill
+    /// std::thread::sleep(Duration::from_millis(500));
+    ///
+    /// // Now start streaming with pre-filled decoder
+    /// client.start_live_streaming_with_decoder(decoder).await?;
+    /// ```
+    pub async fn start_live_streaming_with_decoder(&mut self, decoder: LiveAudioDecoder) -> Result<()> {
+        let connection = self.connection.as_mut().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+
+        // Start live streaming with the provided decoder
+        connection.start_streaming_live(decoder).await?;
+
+        self.emit_event(ClientEvent::PlaybackStateChanged(PlaybackState::Playing)).await;
+
+        Ok(())
     }
 
     /// Pause playback.

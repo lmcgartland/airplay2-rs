@@ -3,6 +3,8 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(all(feature = "bluetooth", target_os = "linux"))]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -13,13 +15,77 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn, error, instrument};
 
 use airplay_client::{AirPlayClient, PlaybackState, ClientEvent, CallbackHandler};
+#[cfg(all(feature = "bluetooth", target_os = "linux"))]
+use airplay_client::{LiveFrameSender, LivePcmFrame};
 use airplay_core::{Device, StreamConfig};
 
 use crate::action::Action;
 use crate::audio_info;
+#[cfg(feature = "bluetooth")]
+use crate::bluetooth_helper;
 use crate::state::{AppState, View, StatusMessage, DeviceEntry};
 use crate::file_browser::FileBrowser;
 use crate::ui;
+
+#[cfg(all(feature = "bluetooth", target_os = "linux"))]
+use airplay_bluetooth::{
+    start_capture, CaptureConfig, calculate_rms,
+};
+
+/// Shared state for the Bluetooth capture forwarding thread.
+#[cfg(all(feature = "bluetooth", target_os = "linux"))]
+struct BtCaptureShared {
+    /// Flag to stop the capture thread.
+    stop: AtomicBool,
+    /// Current audio level (RMS) for UI display.
+    audio_level: std::sync::atomic::AtomicU32,
+    /// Total samples captured for UI display.
+    samples_received: AtomicU64,
+}
+
+/// Write a diagnostic WAV file (16-bit stereo).
+#[cfg(all(feature = "bluetooth", target_os = "linux"))]
+fn write_diagnostic_wav(path: &str, samples: &[i16], sample_rate: u32) -> std::io::Result<()> {
+    use std::fs::File;
+    use std::io::Write;
+
+    let num_samples = samples.len() / 2; // stereo frames
+    let num_channels = 2u16;
+    let bits_per_sample = 16u16;
+    let byte_rate = sample_rate * num_channels as u32 * bits_per_sample as u32 / 8;
+    let block_align = num_channels * bits_per_sample / 8;
+    let data_size = (samples.len() * 2) as u32; // total bytes
+    let file_size = 36 + data_size;
+
+    let mut file = File::create(path)?;
+
+    // RIFF header
+    file.write_all(b"RIFF")?;
+    file.write_all(&file_size.to_le_bytes())?;
+    file.write_all(b"WAVE")?;
+
+    // fmt chunk
+    file.write_all(b"fmt ")?;
+    file.write_all(&16u32.to_le_bytes())?; // chunk size
+    file.write_all(&1u16.to_le_bytes())?; // audio format (PCM)
+    file.write_all(&num_channels.to_le_bytes())?;
+    file.write_all(&sample_rate.to_le_bytes())?;
+    file.write_all(&byte_rate.to_le_bytes())?;
+    file.write_all(&block_align.to_le_bytes())?;
+    file.write_all(&bits_per_sample.to_le_bytes())?;
+
+    // data chunk
+    file.write_all(b"data")?;
+    file.write_all(&data_size.to_le_bytes())?;
+
+    // Write samples (already interleaved)
+    for &sample in samples {
+        file.write_all(&sample.to_le_bytes())?;
+    }
+
+    tracing::info!("Diagnostic WAV: {} frames, {} Hz, {} bytes", num_samples, sample_rate, data_size);
+    Ok(())
+}
 
 /// Main application.
 pub struct App {
@@ -37,6 +103,12 @@ pub struct App {
     should_quit: bool,
     /// Last time feedback was sent to receiver (for periodic keepalive).
     last_feedback_time: Instant,
+    /// Bluetooth capture shared state for communication with capture thread.
+    #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+    bt_capture_shared: Option<Arc<BtCaptureShared>>,
+    /// Bluetooth capture thread handle.
+    #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+    bt_capture_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl App {
@@ -96,6 +168,10 @@ impl App {
             action_rx,
             should_quit: false,
             last_feedback_time: Instant::now(),
+            #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+            bt_capture_shared: None,
+            #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+            bt_capture_thread: None,
         })
     }
 
@@ -212,6 +288,16 @@ impl App {
                 KeyCode::Char('-') => Some(Action::VolumeDown),
                 _ => None,
             },
+            #[cfg(feature = "bluetooth")]
+            View::Bluetooth => match key.code {
+                KeyCode::Char('s') => Some(Action::BluetoothScan),
+                KeyCode::Char('p') => Some(Action::BluetoothPair),
+                KeyCode::Char('c') => Some(Action::BluetoothConnect),
+                KeyCode::Char('d') => Some(Action::BluetoothDisconnect),
+                KeyCode::Char('u') => Some(Action::BluetoothStartSource),
+                KeyCode::Char('i') => Some(Action::BluetoothAutoInstall),
+                _ => None,
+            },
         }
     }
 
@@ -233,6 +319,12 @@ impl App {
             Action::NextView => {
                 self.state.view = self.state.view.next();
                 debug!("Switched to view: {:?}", self.state.view);
+
+                // Check Bluetooth setup when first entering Bluetooth view
+                #[cfg(feature = "bluetooth")]
+                if self.state.view == View::Bluetooth && !self.state.bluetooth.setup_checked {
+                    self.dispatch(Action::BluetoothCheckSetup);
+                }
             }
             Action::Back => {
                 if self.state.view != View::Devices {
@@ -494,6 +586,453 @@ impl App {
                         }
                     }
                 }
+
+                // Update Bluetooth UI from capture thread's shared state (Linux only)
+                #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+                if self.state.bluetooth.is_source_active {
+                    if let Some(ref shared) = self.bt_capture_shared {
+                        // Read audio level from shared state (set by capture thread)
+                        let level_scaled = shared.audio_level.load(Ordering::Relaxed);
+                        self.state.bluetooth.audio_level = level_scaled as f32 / 1000.0;
+                        self.state.bluetooth.samples_received = shared.samples_received.load(Ordering::Relaxed);
+
+                        // Check if capture thread stopped (stop flag set externally or error)
+                        if shared.stop.load(Ordering::Relaxed) {
+                            // Thread signaled stop, check if it's still running
+                            if self.bt_capture_thread.as_ref().map_or(true, |h| h.is_finished()) {
+                                warn!("Bluetooth capture thread stopped");
+                                self.bt_capture_shared = None;
+                                self.bt_capture_thread = None;
+                                self.state.bluetooth.is_source_active = false;
+                                self.state.bluetooth.streaming = false;
+                                self.state.set_status(StatusMessage::error("Audio capture stopped"));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Bluetooth actions (Linux only)
+            #[cfg(feature = "bluetooth")]
+            Action::BluetoothCheckSetup => {
+                debug!("Checking Bluetooth setup");
+
+                let mut issues = Vec::new();
+
+                // Check Bluetooth service
+                if !bluetooth_helper::is_bluetooth_running().await {
+                    issues.push("Bluetooth service not running (sudo systemctl start bluetooth)".to_string());
+                }
+
+                // Check BlueALSA
+                if !bluetooth_helper::is_bluealsa_running().await {
+                    issues.push("BlueALSA not running (sudo systemctl start bluealsa)".to_string());
+                }
+
+                self.state.bluetooth.setup_checked = true;
+                self.state.bluetooth.setup_ready = issues.is_empty();
+                self.state.bluetooth.setup_issues = issues;
+
+                if self.state.bluetooth.setup_ready {
+                    // Auto-initialize adapter and scan for paired devices
+                    self.dispatch(Action::BluetoothInitAdapter);
+                }
+            }
+
+            #[cfg(feature = "bluetooth")]
+            Action::BluetoothAutoInstall => {
+                info!("Attempting automatic Bluetooth setup");
+                self.state.set_status(StatusMessage::info("Please start services manually:"));
+                self.state.bluetooth.setup_issues = vec![
+                    "sudo systemctl start bluetooth".to_string(),
+                    "sudo systemctl start bluealsa".to_string(),
+                ];
+                // Re-check setup after showing instructions
+                let tx = self.action_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let _ = tx.send(Action::BluetoothCheckSetup);
+                });
+            }
+
+            #[cfg(feature = "bluetooth")]
+            Action::BluetoothInitAdapter => {
+                debug!("Initializing Bluetooth adapter");
+
+                self.state.bluetooth.adapter_powered = true;
+                self.state.bluetooth.adapter_name = Some("hci0".to_string());
+
+                // Load paired devices automatically
+                let tx = self.action_tx.clone();
+                tokio::spawn(async move {
+                                        let devices: Vec<crate::state::BluetoothDeviceEntry> =
+                        bluetooth_helper::get_paired_devices().await;
+                    info!("Found {} paired devices", devices.len());
+                    let _ = tx.send(Action::BluetoothDevicesScanned(devices));
+                });
+            }
+
+            #[cfg(feature = "bluetooth")]
+            Action::BluetoothAdapterReady { name, powered } => {
+                self.state.bluetooth.adapter_name = Some(name);
+                self.state.bluetooth.adapter_powered = powered;
+            }
+
+            #[cfg(feature = "bluetooth")]
+            Action::BluetoothScan => {
+                info!("Starting Bluetooth scan");
+                self.state.bluetooth.scanning = true;
+                self.state.set_status(StatusMessage::info("Scanning for Bluetooth devices..."));
+
+                let tx = self.action_tx.clone();
+                tokio::spawn(async move {
+                    
+                    // Start a background scan (10 seconds)
+                    let _ = bluetooth_helper::start_scan().await;
+
+                    // Wait for scan to complete
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+
+                    // Get all discovered devices
+                    let devices: Vec<crate::state::BluetoothDeviceEntry> =
+                        bluetooth_helper::get_discovered_devices().await;
+                    info!("Scan found {} devices", devices.len());
+
+                    let _ = tx.send(Action::BluetoothDevicesScanned(devices));
+                    let _ = tx.send(Action::ShowStatus("Scan complete".to_string()));
+                });
+            }
+
+            #[cfg(feature = "bluetooth")]
+            Action::BluetoothDevicesScanned(devices) => {
+                self.state.bluetooth.scanning = false;
+                self.state.bluetooth.devices = devices;
+                if self.state.bluetooth.device_index >= self.state.bluetooth.devices.len() {
+                    self.state.bluetooth.device_index = 0;
+                }
+            }
+
+            #[cfg(feature = "bluetooth")]
+            Action::BluetoothPair => {
+                if let Some(device) = self.state.bluetooth.selected_device().cloned() {
+                    info!("Pairing with {}", device.name);
+                    self.state.set_status(StatusMessage::info(format!("Pairing with {}...", device.name)));
+
+                    let tx = self.action_tx.clone();
+                    let address = device.address.clone();
+                    let name = device.name.clone();
+                    tokio::spawn(async move {
+                        
+                        match bluetooth_helper::pair_device(&address).await {
+                            Ok(()) => {
+                                let _ = tx.send(Action::ShowStatus(format!("Paired with {}", name)));
+                                // Refresh device list
+                                let devices: Vec<crate::state::BluetoothDeviceEntry> =
+                                    bluetooth_helper::get_discovered_devices().await;
+                                let _ = tx.send(Action::BluetoothDevicesScanned(devices));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Action::BluetoothError(e));
+                            }
+                        }
+                    });
+                }
+            }
+
+            #[cfg(feature = "bluetooth")]
+            Action::BluetoothConnect => {
+                if let Some(device) = self.state.bluetooth.selected_device().cloned() {
+                    info!("Connecting to {}", device.name);
+                    self.state.set_status(StatusMessage::info(format!("Connecting to {}...", device.name)));
+
+                    let tx = self.action_tx.clone();
+                    let address = device.address.clone();
+                    let name = device.name.clone();
+                    tokio::spawn(async move {
+                        
+                        match bluetooth_helper::connect_device(&address).await {
+                            Ok(()) => {
+                                // Wait a moment for BlueALSA to detect the audio stream
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                                // Check if audio stream is active
+                                let has_audio = bluetooth_helper::has_active_audio_stream(&address).await;
+
+                                let entry = crate::state::BluetoothDeviceEntry {
+                                    address,
+                                    name: name.clone(),
+                                    paired: true,
+                                    connected: true,
+                                    trusted: true,
+                                    supports_a2dp: has_audio,
+                                    rssi: None,
+                                };
+
+                                let _ = tx.send(Action::BluetoothConnected(entry));
+                                if has_audio {
+                                    let _ = tx.send(Action::ShowStatus(format!("Connected to {} (audio streaming)", name)));
+                                } else {
+                                    let _ = tx.send(Action::ShowStatus(format!("Connected to {} (no audio yet - start playing)", name)));
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Action::BluetoothError(e));
+                            }
+                        }
+                    });
+                }
+            }
+
+            #[cfg(feature = "bluetooth")]
+            Action::BluetoothConnected(device) => {
+                info!("Connected to Bluetooth device: {}", device.name);
+                self.state.bluetooth.connected_device = Some(device.clone());
+                self.state.set_status(StatusMessage::info(format!("Connected to {}", device.name)));
+                // Update device list to show connection status
+                for entry in &mut self.state.bluetooth.devices {
+                    entry.connected = entry.address == device.address;
+                }
+            }
+
+            #[cfg(feature = "bluetooth")]
+            Action::BluetoothDisconnect => {
+                if let Some(ref device) = self.state.bluetooth.connected_device.clone() {
+                    info!("Disconnecting from {}", device.name);
+                    self.state.set_status(StatusMessage::info(format!("Disconnecting from {}...", device.name)));
+
+                    let tx = self.action_tx.clone();
+                    let address = device.address.clone();
+                    tokio::spawn(async move {
+                        
+                        match bluetooth_helper::disconnect_device(&address).await {
+                            Ok(()) => {
+                                let _ = tx.send(Action::BluetoothDisconnected);
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Action::BluetoothError(e));
+                            }
+                        }
+                    });
+                } else {
+                    self.dispatch(Action::BluetoothDisconnected);
+                }
+            }
+
+            #[cfg(feature = "bluetooth")]
+            Action::BluetoothDisconnected => {
+                self.state.bluetooth.connected_device = None;
+                self.state.bluetooth.streaming = false;
+                self.state.bluetooth.is_source_active = false;
+                for entry in &mut self.state.bluetooth.devices {
+                    entry.connected = false;
+                }
+                self.state.set_status(StatusMessage::info("Bluetooth disconnected"));
+            }
+
+            #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+            Action::BluetoothStartSource => {
+                if let Some(ref device) = self.state.bluetooth.connected_device.clone() {
+                    // First check if we're connected to an AirPlay device
+                    let client_connected = {
+                        let client = self.client.lock().await;
+                        client.is_connected()
+                    };
+
+                    if !client_connected {
+                        self.state.set_status(StatusMessage::error("Connect to an AirPlay device first"));
+                        return;
+                    }
+
+                    info!("Starting Bluetooth audio source from {}", device.address);
+
+                    // Stop any existing capture thread
+                    if let Some(ref shared) = self.bt_capture_shared {
+                        shared.stop.store(true, Ordering::Relaxed);
+                    }
+                    if let Some(handle) = self.bt_capture_thread.take() {
+                        let _ = handle.join();
+                    }
+                    self.bt_capture_shared = None;
+
+                    // Start BlueALSA capture (using HD config for aptX HD turntable)
+                    let config = CaptureConfig::for_bluealsa_hd(&device.address);
+                    match start_capture(config) {
+                        Ok(mut capture) => {
+                            info!("BlueALSA capture started successfully");
+
+                            // Create sender/decoder pair FIRST with larger buffer for pre-fill
+                            // 64 frames @ ~23ms each = ~1.5 seconds of buffer capacity
+                            use airplay_client::LiveAudioDecoder;
+                            let (sender, decoder) = LiveAudioDecoder::create_pair(44100, 2, 64);
+
+                            // Create shared state for capture thread
+                            let shared = Arc::new(BtCaptureShared {
+                                stop: AtomicBool::new(false),
+                                audio_level: std::sync::atomic::AtomicU32::new(0),
+                                samples_received: AtomicU64::new(0),
+                            });
+                            let shared_clone = Arc::clone(&shared);
+
+                            // Spawn capture thread BEFORE starting streaming
+                            // This allows frames to flow into the decoder's channel
+                            let thread = std::thread::Builder::new()
+                                .name("bt-capture".into())
+                                .spawn(move || {
+                                    info!("Bluetooth capture thread started");
+                                    let mut total_frames_sent = 0u64;
+
+                                    while !shared_clone.stop.load(Ordering::Relaxed) {
+                                        match capture.recv_timeout(Duration::from_millis(50)) {
+                                            Ok(frame) => {
+                                                let rms = calculate_rms(&frame.samples);
+                                                shared_clone.audio_level.store(
+                                                    (rms * 1000.0) as u32,
+                                                    Ordering::Relaxed
+                                                );
+
+                                                let samples = frame.samples.len() / 2;
+                                                shared_clone.samples_received.fetch_add(
+                                                    samples as u64,
+                                                    Ordering::Relaxed
+                                                );
+
+                                                let live_frame = LivePcmFrame {
+                                                    samples: frame.samples,
+                                                    channels: 2,
+                                                    sample_rate: 44100,
+                                                };
+
+                                                if sender.try_send(live_frame) {
+                                                    total_frames_sent += 1;
+                                                    if total_frames_sent % 100 == 0 {
+                                                        debug!("Sent {} frames to AirPlay", total_frames_sent);
+                                                    }
+                                                } else if sender.is_full() {
+                                                    debug!("Live sender channel full, dropping frame");
+                                                }
+                                            }
+                                            Err(airplay_bluetooth::BluetoothError::Timeout) => {
+                                                // No data available, continue
+                                            }
+                                            Err(e) => {
+                                                error!("Capture error: {}", e);
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    info!("Bluetooth capture thread stopping, sent {} frames", total_frames_sent);
+                                    capture.stop();
+                                })
+                                .expect("Failed to spawn capture thread");
+
+                            // Wait for channel to pre-fill before starting streaming
+                            // This ensures the streamer has audio data when it starts
+                            info!("Waiting for capture buffer to pre-fill...");
+                            std::thread::sleep(Duration::from_millis(500));
+                            info!("Pre-fill complete, starting AirPlay streaming");
+
+                            // Now start streaming with the pre-filled decoder
+                            // Set a moderate render delay (500ms) for live streaming to give
+                            // the AirPlay receiver time to build its jitter buffer
+                            let stream_result = {
+                                let mut client = self.client.lock().await;
+                                client.set_render_delay_ms(500);
+                                client.start_live_streaming_with_decoder(decoder).await
+                            };
+
+                            match stream_result {
+                                Ok(()) => {
+                                    info!("Live AirPlay streaming started successfully");
+                                    self.bt_capture_shared = Some(shared);
+                                    self.bt_capture_thread = Some(thread);
+                                    self.state.bluetooth.is_source_active = true;
+                                    self.state.bluetooth.streaming = true;
+                                    self.state.bluetooth.samples_received = 0;
+                                    self.state.set_status(StatusMessage::info(format!(
+                                        "Streaming {} → AirPlay",
+                                        device.name
+                                    )));
+                                }
+                                Err(e) => {
+                                    error!("Failed to start live streaming: {}", e);
+                                    // Stop the capture thread since streaming failed
+                                    shared.stop.store(true, Ordering::Relaxed);
+                                    let _ = thread.join();
+                                    self.state.set_status(StatusMessage::error(format!(
+                                        "Failed to start streaming: {}",
+                                        e
+                                    )));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to start BlueALSA capture: {}", e);
+                            self.state.set_status(StatusMessage::error(format!(
+                                "Failed to start capture: {}. Make sure device is playing audio.",
+                                e
+                            )));
+                        }
+                    }
+                } else {
+                    self.state.set_status(StatusMessage::error("No Bluetooth device connected"));
+                }
+            }
+
+            #[cfg(all(feature = "bluetooth", not(target_os = "linux")))]
+            Action::BluetoothStartSource => {
+                self.state.set_status(StatusMessage::error("Bluetooth audio source only supported on Linux"));
+            }
+
+            #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+            Action::BluetoothStopSource => {
+                info!("Stopping Bluetooth audio source");
+
+                // Signal capture thread to stop
+                if let Some(ref shared) = self.bt_capture_shared {
+                    shared.stop.store(true, Ordering::Relaxed);
+                }
+
+                // Wait for thread to finish
+                if let Some(handle) = self.bt_capture_thread.take() {
+                    let _ = handle.join();
+                }
+                self.bt_capture_shared = None;
+
+                // Stop AirPlay playback
+                {
+                    let mut client = self.client.lock().await;
+                    if let Err(e) = client.stop().await {
+                        warn!("Failed to stop AirPlay playback: {}", e);
+                    }
+                }
+
+                self.state.bluetooth.is_source_active = false;
+                self.state.bluetooth.streaming = false;
+                self.state.set_status(StatusMessage::info("Bluetooth audio source stopped"));
+            }
+
+            #[cfg(all(feature = "bluetooth", not(target_os = "linux")))]
+            Action::BluetoothStopSource => {
+                self.state.bluetooth.is_source_active = false;
+                self.state.bluetooth.streaming = false;
+            }
+
+            #[cfg(feature = "bluetooth")]
+            Action::BluetoothAudioLevel { level, samples } => {
+                self.state.bluetooth.audio_level = level;
+                self.state.bluetooth.samples_received = samples;
+            }
+
+            #[cfg(feature = "bluetooth")]
+            Action::BluetoothStreamingStatus(is_streaming) => {
+                self.state.bluetooth.streaming = is_streaming;
+            }
+
+            #[cfg(feature = "bluetooth")]
+            Action::BluetoothError(e) => {
+                error!("Bluetooth error: {}", e);
+                self.state.set_status(StatusMessage::error(e));
             }
         }
     }
@@ -523,6 +1062,13 @@ impl App {
                 if let Some(entry) = self.state.devices.get_mut(self.state.device_index) {
                     entry.is_selected = !entry.is_selected;
                     debug!("Toggled device selection: {} = {}", entry.device.name, entry.is_selected);
+                }
+            }
+            #[cfg(feature = "bluetooth")]
+            View::Bluetooth => {
+                // Connect to selected Bluetooth device
+                if self.state.bluetooth.selected_device().is_some() {
+                    self.dispatch(Action::BluetoothConnect);
                 }
             }
         }

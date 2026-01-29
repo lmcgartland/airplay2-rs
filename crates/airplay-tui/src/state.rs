@@ -16,6 +16,9 @@ pub enum View {
     Player,
     /// Multi-room group management.
     Group,
+    /// Bluetooth audio source (Linux only).
+    #[cfg(feature = "bluetooth")]
+    Bluetooth,
 }
 
 impl View {
@@ -25,6 +28,11 @@ impl View {
             View::Devices => View::Browser,
             View::Browser => View::Player,
             View::Player => View::Group,
+            #[cfg(feature = "bluetooth")]
+            View::Group => View::Bluetooth,
+            #[cfg(feature = "bluetooth")]
+            View::Bluetooth => View::Devices,
+            #[cfg(not(feature = "bluetooth"))]
             View::Group => View::Devices,
         }
     }
@@ -32,10 +40,15 @@ impl View {
     /// Get the previous view in the cycle.
     pub fn prev(self) -> Self {
         match self {
+            #[cfg(feature = "bluetooth")]
+            View::Devices => View::Bluetooth,
+            #[cfg(not(feature = "bluetooth"))]
             View::Devices => View::Group,
             View::Browser => View::Devices,
             View::Player => View::Browser,
             View::Group => View::Player,
+            #[cfg(feature = "bluetooth")]
+            View::Bluetooth => View::Group,
         }
     }
 
@@ -46,6 +59,32 @@ impl View {
             View::Browser => "Browser",
             View::Player => "Player",
             View::Group => "Group",
+            #[cfg(feature = "bluetooth")]
+            View::Bluetooth => "Bluetooth",
+        }
+    }
+
+    /// Get all views in order.
+    pub fn all() -> Vec<View> {
+        #[cfg(feature = "bluetooth")]
+        {
+            vec![View::Devices, View::Browser, View::Player, View::Group, View::Bluetooth]
+        }
+        #[cfg(not(feature = "bluetooth"))]
+        {
+            vec![View::Devices, View::Browser, View::Player, View::Group]
+        }
+    }
+
+    /// Get the index of this view in the tab bar.
+    pub fn index(&self) -> usize {
+        match self {
+            View::Devices => 0,
+            View::Browser => 1,
+            View::Player => 2,
+            View::Group => 3,
+            #[cfg(feature = "bluetooth")]
+            View::Bluetooth => 4,
         }
     }
 }
@@ -128,6 +167,10 @@ pub struct AppState {
     pub group: Option<DeviceGroupState>,
     /// Selected index in group member list.
     pub group_member_index: usize,
+
+    // Bluetooth state (Linux only)
+    #[cfg(feature = "bluetooth")]
+    pub bluetooth: BluetoothState,
 }
 
 /// Device group state for UI.
@@ -143,6 +186,101 @@ pub struct GroupMemberState {
     pub device: Device,
     pub volume: f32,
     pub is_leader: bool,
+}
+
+/// Bluetooth state for UI.
+#[cfg(feature = "bluetooth")]
+#[derive(Debug, Clone)]
+pub struct BluetoothState {
+    /// System setup status (BlueZ, BlueALSA).
+    pub setup_checked: bool,
+    /// Whether system is ready for Bluetooth.
+    pub setup_ready: bool,
+    /// Setup issues to display.
+    pub setup_issues: Vec<String>,
+    /// Whether Bluetooth adapter is powered.
+    pub adapter_powered: bool,
+    /// Adapter name (e.g., "hci0").
+    pub adapter_name: Option<String>,
+    /// Whether scanning for devices.
+    pub scanning: bool,
+    /// Discovered Bluetooth devices.
+    pub devices: Vec<BluetoothDeviceEntry>,
+    /// Selected device index.
+    pub device_index: usize,
+    /// Currently connected A2DP device.
+    pub connected_device: Option<BluetoothDeviceEntry>,
+    /// Whether streaming audio from Bluetooth.
+    pub streaming: bool,
+    /// Whether using Bluetooth as audio source for AirPlay.
+    pub is_source_active: bool,
+    /// Current audio level (RMS, 0.0-1.0).
+    pub audio_level: f32,
+    /// Total samples received.
+    pub samples_received: u64,
+}
+
+/// Bluetooth device entry for UI.
+#[cfg(feature = "bluetooth")]
+#[derive(Debug, Clone)]
+pub struct BluetoothDeviceEntry {
+    /// Device address.
+    pub address: String,
+    /// Device name.
+    pub name: String,
+    /// Whether paired.
+    pub paired: bool,
+    /// Whether connected.
+    pub connected: bool,
+    /// Whether trusted.
+    pub trusted: bool,
+    /// Whether supports A2DP audio source.
+    pub supports_a2dp: bool,
+    /// Signal strength (RSSI).
+    pub rssi: Option<i16>,
+}
+
+#[cfg(feature = "bluetooth")]
+impl Default for BluetoothState {
+    fn default() -> Self {
+        Self {
+            setup_checked: false,
+            setup_ready: false,
+            setup_issues: Vec::new(),
+            adapter_powered: false,
+            adapter_name: None,
+            scanning: false,
+            devices: Vec::new(),
+            device_index: 0,
+            connected_device: None,
+            streaming: false,
+            is_source_active: false,
+            audio_level: 0.0,
+            samples_received: 0,
+        }
+    }
+}
+
+#[cfg(feature = "bluetooth")]
+impl BluetoothState {
+    /// Get selected device (if any).
+    pub fn selected_device(&self) -> Option<&BluetoothDeviceEntry> {
+        self.devices.get(self.device_index)
+    }
+
+    /// Move selection up.
+    pub fn select_prev(&mut self) {
+        if !self.devices.is_empty() && self.device_index > 0 {
+            self.device_index -= 1;
+        }
+    }
+
+    /// Move selection down.
+    pub fn select_next(&mut self) {
+        if !self.devices.is_empty() && self.device_index < self.devices.len() - 1 {
+            self.device_index += 1;
+        }
+    }
 }
 
 impl Default for AppState {
@@ -162,6 +300,8 @@ impl Default for AppState {
             current_file: None,
             group: None,
             group_member_index: 0,
+            #[cfg(feature = "bluetooth")]
+            bluetooth: BluetoothState::default(),
         }
     }
 }
@@ -207,6 +347,10 @@ impl AppState {
                     }
                 }
             }
+            #[cfg(feature = "bluetooth")]
+            View::Bluetooth => {
+                self.bluetooth.select_prev();
+            }
             _ => {}
         }
     }
@@ -226,6 +370,10 @@ impl AppState {
                         self.group_member_index += 1;
                     }
                 }
+            }
+            #[cfg(feature = "bluetooth")]
+            View::Bluetooth => {
+                self.bluetooth.select_next();
             }
             _ => {}
         }

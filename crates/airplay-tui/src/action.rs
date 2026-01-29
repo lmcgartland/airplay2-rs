@@ -93,4 +93,54 @@ pub enum Action {
     ClearStatus,
     /// Tick for periodic updates.
     Tick,
+
+    // Bluetooth actions (Linux only)
+    #[cfg(feature = "bluetooth")]
+    /// Check Bluetooth system setup.
+    BluetoothCheckSetup,
+    #[cfg(feature = "bluetooth")]
+    /// Attempt automatic Bluetooth setup.
+    BluetoothAutoInstall,
+    #[cfg(feature = "bluetooth")]
+    /// Initialize Bluetooth adapter.
+    BluetoothInitAdapter,
+    #[cfg(feature = "bluetooth")]
+    /// Adapter initialized successfully.
+    BluetoothAdapterReady { name: String, powered: bool },
+    #[cfg(feature = "bluetooth")]
+    /// Scan for Bluetooth devices.
+    BluetoothScan,
+    #[cfg(feature = "bluetooth")]
+    /// Scan completed with devices.
+    BluetoothDevicesScanned(Vec<crate::state::BluetoothDeviceEntry>),
+    #[cfg(feature = "bluetooth")]
+    /// Pair with selected device.
+    BluetoothPair,
+    #[cfg(feature = "bluetooth")]
+    /// Connect to selected device.
+    BluetoothConnect,
+    #[cfg(feature = "bluetooth")]
+    /// Device connected.
+    BluetoothConnected(crate::state::BluetoothDeviceEntry),
+    #[cfg(feature = "bluetooth")]
+    /// Disconnect from Bluetooth device.
+    BluetoothDisconnect,
+    #[cfg(feature = "bluetooth")]
+    /// Device disconnected.
+    BluetoothDisconnected,
+    #[cfg(feature = "bluetooth")]
+    /// Start using Bluetooth as audio source for AirPlay.
+    BluetoothStartSource,
+    #[cfg(feature = "bluetooth")]
+    /// Stop using Bluetooth as audio source.
+    BluetoothStopSource,
+    #[cfg(feature = "bluetooth")]
+    /// Update audio level meter.
+    BluetoothAudioLevel { level: f32, samples: u64 },
+    #[cfg(feature = "bluetooth")]
+    /// Update streaming status.
+    BluetoothStreamingStatus(bool),
+    #[cfg(feature = "bluetooth")]
+    /// Bluetooth error occurred.
+    BluetoothError(String),
 }

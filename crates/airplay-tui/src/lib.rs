@@ -6,6 +6,8 @@
 pub mod action;
 pub mod app;
 pub mod audio_info;
+#[cfg(feature = "bluetooth")]
+pub mod bluetooth_helper;
 pub mod file_browser;
 pub mod state;
 pub mod ui;

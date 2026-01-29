@@ -3,6 +3,8 @@
 mod action;
 mod app;
 mod audio_info;
+#[cfg(feature = "bluetooth")]
+mod bluetooth_helper;
 mod file_browser;
 mod state;
 mod ui;

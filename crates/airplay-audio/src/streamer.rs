@@ -1,7 +1,7 @@
 //! High-level audio streaming orchestrator.
 
 use airplay_core::{StreamConfig, error::Result};
-use crate::{AudioBuffer, AudioDecoder, RtpSender};
+use crate::{AudioBuffer, AudioDecoder, RtpSender, LiveAudioDecoder};
 use crate::encoder::{create_encoder, AudioEncoder};
 use airplay_timing::{Clock, ClockOffset, unix_to_ntp};
 use std::sync::{Arc, atomic::{AtomicU64, AtomicU8, Ordering}};
@@ -317,6 +317,8 @@ struct StreamerInner {
     clock_offset: Option<ClockOffset>,
     timing_rx: Option<watch::Receiver<ClockOffset>>,
     decoder: Option<AudioDecoder>,
+    /// Live audio decoder for streaming from external sources (e.g., Bluetooth).
+    live_decoder: Option<LiveAudioDecoder>,
     encoder: Option<Box<dyn AudioEncoder>>,
     /// Track whether first audio packet has been sent (requires marker bit)
     first_packet_sent: bool,
@@ -367,6 +369,7 @@ impl AudioStreamer {
                 clock_offset: None,
                 timing_rx: None,
                 decoder: None,
+                live_decoder: None,
                 encoder: None,
                 first_packet_sent: false,
                 render_delay_ns: 0,
@@ -497,6 +500,131 @@ impl AudioStreamer {
         Ok(())
     }
 
+    /// Start streaming from live audio source (e.g., Bluetooth capture).
+    ///
+    /// This is similar to `start()` but uses a `LiveAudioDecoder` that receives
+    /// PCM frames from a channel, enabling streaming from external sources like
+    /// Bluetooth audio capture.
+    pub async fn start_live(&mut self, live_decoder: LiveAudioDecoder) -> Result<()> {
+        let frame_duration_ns;
+        {
+            let mut inner = self.inner.lock().await;
+            inner.live_decoder = Some(live_decoder);
+            inner.decoder = None; // Clear file decoder if any
+            inner.encoder = Some(create_encoder(inner.config.audio_format.clone())?);
+            inner.state = StreamerState::Buffering;
+            frame_duration_ns = inner.config.audio_format.frames_per_packet as u64
+                * 1_000_000_000u64
+                / inner.config.audio_format.sample_rate.as_hz() as u64;
+        }
+        self.state_cache.store(StreamerState::Buffering as u8, Ordering::Relaxed);
+
+        // For live streaming, wait for initial buffer fill before streaming.
+        // This prevents startup artifacts from sending packets before we have
+        // enough audio data buffered. Target ~500ms of buffer (about 60 packets
+        // at 352 frames/packet, 44.1kHz).
+        tracing::info!("Live streaming: waiting for initial buffer fill...");
+        let buffer_start = std::time::Instant::now();
+        let max_wait = std::time::Duration::from_secs(5);
+        let target_fill_pct = 50.0; // Wait for 50% of 2000ms buffer = 1000ms
+
+        loop {
+            // Try to decode some frames into the buffer
+            {
+                let mut guard = self.inner.lock().await;
+                decode_some_inner(&mut guard)?;
+                let fill_pct = guard.buffer.fill_percentage();
+                let frame_count = guard.buffer.len();
+
+                if fill_pct >= target_fill_pct {
+                    tracing::info!(
+                        "Live streaming: buffer ready at {:.1}% ({} frames), starting playback",
+                        fill_pct, frame_count
+                    );
+                    guard.state = StreamerState::Streaming;
+                    self.state_cache.store(StreamerState::Streaming as u8, Ordering::Relaxed);
+                    break;
+                }
+
+                if buffer_start.elapsed() > max_wait {
+                    tracing::warn!(
+                        "Live streaming: buffer timeout at {:.1}% ({} frames), starting anyway",
+                        fill_pct, frame_count
+                    );
+                    guard.state = StreamerState::Streaming;
+                    self.state_cache.store(StreamerState::Streaming as u8, Ordering::Relaxed);
+                    break;
+                }
+
+                if buffer_start.elapsed().as_millis() % 500 == 0 {
+                    tracing::debug!(
+                        "Live streaming: buffering {:.1}% ({} frames)...",
+                        fill_pct, frame_count
+                    );
+                }
+            }
+            // Small delay before retry
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        if self.task.is_none() {
+            // Set up the dedicated sender thread with cloned sockets
+            let (tx, rx) = bounded::<SenderMessage>(8);
+            let frame_duration = std::time::Duration::from_nanos(frame_duration_ns);
+
+            {
+                let inner = self.inner.lock().await;
+                if let Some(ref rtp_sender) = inner.rtp_sender {
+                    if let Ok(Some((data_sock, data_dest))) = rtp_sender.clone_data_socket() {
+                        let ctrl = rtp_sender.clone_control_socket().ok().flatten();
+                        let (ctrl_sock, ctrl_dest) = match ctrl {
+                            Some((s, d)) => (Some(s), Some(d)),
+                            None => (None, None),
+                        };
+
+                        let thread = std::thread::Builder::new()
+                            .name("rt-sender".into())
+                            .spawn(move || {
+                                sender_thread_main(
+                                    rx,
+                                    data_sock,
+                                    data_dest,
+                                    ctrl_sock,
+                                    ctrl_dest,
+                                    frame_duration,
+                                );
+                            })
+                            .expect("Failed to spawn sender thread");
+                        self.sender_thread = Some(thread);
+                        self.sender_tx = Some(tx);
+                    } else {
+                        tracing::warn!("RTP sender has no socket, falling back to async timing");
+                    }
+                }
+            }
+
+            let inner = self.inner.clone();
+            let state_cache = self.state_cache.clone();
+            let timestamp_cache = self.timestamp_cache.clone();
+            let sender_tx = self.sender_tx.clone();
+            self.task = Some(tokio::spawn(async move {
+                match run_streamer(inner.clone(), state_cache.clone(), timestamp_cache, sender_tx).await {
+                    Ok(()) => tracing::debug!("Live streaming task completed normally"),
+                    Err(e) => {
+                        tracing::error!("Live streaming task error: {}", e);
+                        state_cache.store(StreamerState::Error as u8, Ordering::Relaxed);
+                        if let Ok(mut guard) = inner.try_lock() {
+                            guard.state = StreamerState::Error;
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        }
+
+        Ok(())
+    }
+
     /// Pause streaming.
     pub async fn pause(&mut self) -> Result<()> {
         let mut inner = self.inner.lock().await;
@@ -604,22 +732,37 @@ impl AudioStreamer {
 }
 
 fn decode_some_inner(inner: &mut StreamerInner) -> Result<()> {
-    if let Some(ref mut decoder) = inner.decoder {
-        let format = inner.config.audio_format.clone();
-        let frames_per_packet = format.frames_per_packet as usize;
+    let format = inner.config.audio_format.clone();
+    let frames_per_packet = format.frames_per_packet as usize;
+    let is_live = inner.live_decoder.is_some();
 
-        // Decode 5 frames per batch to minimize blocking in send loop.
-        // Very small batches ensure minimal interference with precise timing.
-        for _ in 0..5 {
-            if let Some(frame) = decoder.decode_resampled(&format, frames_per_packet)? {
-                let audio_frame = crate::AudioFrame::new(frame.samples, frame.timestamp);
-                inner
-                    .buffer
-                    .push(audio_frame)
-                    .map_err(|_| airplay_core::error::StreamingError::BufferOverflow)?;
-            } else {
-                break;
-            }
+    // Decode 3 frames per batch to minimize blocking in send loop.
+    // Very small batches ensure minimal interference with precise timing.
+    // With 2ms timeout per frame, worst case is ~6ms blocking.
+    for _ in 0..3 {
+        // Try live decoder first (for Bluetooth/external sources), then file decoder
+        let frame = if let Some(ref mut live_decoder) = inner.live_decoder {
+            live_decoder.decode_resampled(&format, frames_per_packet)?
+        } else if let Some(ref mut decoder) = inner.decoder {
+            decoder.decode_resampled(&format, frames_per_packet)?
+        } else {
+            break;
+        };
+
+        if let Some(frame) = frame {
+            let audio_frame = crate::AudioFrame::new(frame.samples, frame.timestamp);
+            inner
+                .buffer
+                .push(audio_frame)
+                .map_err(|_| airplay_core::error::StreamingError::BufferOverflow)?;
+        } else if is_live {
+            // For live streams, None means timeout (no data yet), not EOF.
+            // Don't break - just return and try again later.
+            // This prevents the streamer from stopping on temporary data gaps.
+            break;
+        } else {
+            // For file decoders, None means EOF
+            break;
         }
     }
     Ok(())
@@ -672,9 +815,10 @@ async fn run_streamer(
                     guard.clock_offset = Some(latest);
                 }
             }
-            // Keep buffer reasonably full (60% threshold) but not too aggressive
-            // to avoid blocking the send loop with decode operations
-            if guard.buffer.fill_percentage() < 60.0 {
+            // Keep buffer above 40% but don't decode too aggressively
+            // to avoid blocking the send loop with decode operations.
+            // With 50% initial fill, we have plenty of headroom.
+            if guard.buffer.fill_percentage() < 40.0 {
                 let decode_start = Instant::now();
                 decode_some_inner(&mut guard)?;
                 let decode_elapsed = decode_start.elapsed();
@@ -691,19 +835,28 @@ async fn run_streamer(
                 if guard.buffer.fill_percentage() > 10.0 {
                     guard.state = StreamerState::Streaming;
                     state_cache.store(StreamerState::Streaming as u8, Ordering::Relaxed);
-                } else if guard.decoder.as_ref().map_or(true, |d| d.is_eof()) && guard.buffer.is_empty() {
-                    // Decoder exhausted and buffer empty - playback complete
-                    tracing::info!("Decoder EOF and buffer empty - stopping");
-                    guard.state = StreamerState::Stopped;
-                    state_cache.store(StreamerState::Stopped as u8, Ordering::Relaxed);
-                    break;
                 } else {
-                    // Still buffering, wait and retry
-                    drop(guard);
-                    sleep(Duration::from_millis(10)).await;
-                    // Reset deadline after buffering stall
-                    next_deadline = Instant::now();
-                    continue;
+                    // Check if decoder(s) are exhausted
+                    let decoder_eof = guard.decoder.as_ref().map_or(true, |d| d.is_eof());
+                    let live_decoder_eof = guard.live_decoder.as_ref().map_or(true, |d| d.is_eof());
+                    let has_any_decoder = guard.decoder.is_some() || guard.live_decoder.is_some();
+
+                    // Only stop if we have a decoder and it's exhausted with empty buffer
+                    // For live decoders, we keep waiting unless explicitly marked EOF
+                    if has_any_decoder && decoder_eof && live_decoder_eof && guard.buffer.is_empty() {
+                        // Decoder exhausted and buffer empty - playback complete
+                        tracing::info!("Decoder EOF and buffer empty - stopping");
+                        guard.state = StreamerState::Stopped;
+                        state_cache.store(StreamerState::Stopped as u8, Ordering::Relaxed);
+                        break;
+                    } else {
+                        // Still buffering, wait and retry
+                        drop(guard);
+                        sleep(Duration::from_millis(10)).await;
+                        // Reset deadline after buffering stall
+                        next_deadline = Instant::now();
+                        continue;
+                    }
                 }
             }
 
