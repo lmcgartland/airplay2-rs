@@ -281,6 +281,185 @@ Key dependencies (all pure Rust except FDK-AAC which compiles from vendored C so
 - `plist` - Binary plist encoding
 - `ratatui` - Terminal UI framework
 
+## Bluetooth A2DP Sink (Raspberry Pi)
+
+The TUI includes a Bluetooth tab (Linux only) that receives audio from Bluetooth devices (turntables, phones) and streams it to AirPlay speakers.
+
+### Requirements
+
+- Raspberry Pi running Raspberry Pi OS (Bookworm/Trixie)
+- Bluetooth adapter (built-in or USB dongle)
+- BlueALSA (bluez-alsa) for Bluetooth audio capture
+
+### Setup (BlueALSA)
+
+BlueALSA provides reliable A2DP audio capture with support for high-quality codecs like aptX HD.
+
+```bash
+# Install BlueALSA (if not already installed)
+sudo apt-get install bluez-alsa-utils
+
+# Disable PipeWire's Bluetooth support (if running) to avoid conflicts
+mkdir -p ~/.config/wireplumber/wireplumber.conf.d
+cat > ~/.config/wireplumber/wireplumber.conf.d/90-disable-bluez.conf << 'EOF'
+wireplumber.profiles = {
+  main = {
+    monitor.bluez = disabled
+    monitor.bluez-midi = disabled
+  }
+}
+EOF
+systemctl --user restart wireplumber
+
+# Enable and start BlueALSA
+sudo systemctl enable bluealsa
+sudo systemctl start bluealsa
+
+# Ensure Bluetooth service is running
+sudo systemctl enable bluetooth
+sudo systemctl start bluetooth
+
+# Make Pi discoverable and pairable
+sudo bluetoothctl
+[bluetooth]# power on
+[bluetooth]# discoverable on
+[bluetooth]# discoverable-timeout 0
+[bluetooth]# pairable on
+[bluetooth]# agent on
+[bluetooth]# default-agent
+```
+
+### Pair a Bluetooth Device
+
+```bash
+sudo bluetoothctl
+[bluetooth]# scan on
+# Wait for device to appear (e.g., "Pro-Ject HD")
+
+# Trust, pair and connect (replace XX:XX:XX:XX:XX:XX with device address)
+[bluetooth]# trust XX:XX:XX:XX:XX:XX
+[bluetooth]# pair XX:XX:XX:XX:XX:XX
+# Enter PIN if prompted (some devices use 0000 or auto-accept)
+[bluetooth]# connect XX:XX:XX:XX:XX:XX
+[bluetooth]# exit
+```
+
+### Verify Audio Streaming
+
+```bash
+# Check BlueALSA sees the device
+bluealsactl list-pcms
+# Should show: /org/bluealsa/hci0/dev_XX_XX_XX_XX_XX_XX/a2dpsnk/source
+
+# Test recording (while device is playing audio)
+arecord -D bluealsa:DEV=XX:XX:XX:XX:XX:XX,PROFILE=a2dp \
+  -f S24_LE -r 48000 -c 2 -d 5 /tmp/test.wav
+
+# Verify the recording has audio content
+file /tmp/test.wav
+# Should show: WAVE audio, Microsoft PCM, 24 bit, stereo 48000 Hz
+```
+
+### Run TUI with Bluetooth
+
+```bash
+# Build with Bluetooth feature (cross-compile)
+./utils/cross-compile.sh
+
+# Or build on Pi directly
+cargo build -p airplay-tui --features bluetooth --release
+
+# Run
+./airplay-tui
+# Navigate to Bluetooth tab with Tab key
+```
+
+### Troubleshooting
+
+**Device won't pair / authentication fails**:
+- Put the device in pairing mode first (check device manual)
+- Trust the device before pairing: `bluetoothctl trust XX:XX:XX:XX:XX:XX`
+- Some devices (like turntables) may auto-pair when they detect the Pi
+
+**Device pairs but no audio stream / "Capabilities blob size exceeded" error**:
+- The default Debian BlueALSA package has a small capabilities buffer
+- Build BlueALSA from source with the fix (see `docs/BLUETOOTH_ALSA_EVALUATION.md`)
+- The device must be **actively playing audio** - for turntables, the needle must be on a spinning record
+
+**No PCM in bluealsactl list-pcms**:
+- Check the device is connected: `bluetoothctl info XX:XX:XX:XX:XX:XX`
+- Ensure BlueALSA is running: `sudo systemctl status bluealsa`
+- Check for errors: `journalctl -u bluealsa -f`
+- Reconnect the device: `bluetoothctl disconnect XX:XX:XX:XX:XX:XX && bluetoothctl connect XX:XX:XX:XX:XX:XX`
+
+**"UUID already registered" warnings**:
+- Both PipeWire and BlueALSA are trying to handle Bluetooth audio
+- Disable PipeWire's bluez monitor (see setup instructions above)
+
+**Poor audio quality / dropouts**:
+- Disable WiFi power management: `sudo iwconfig wlan0 power off`
+- Move the Pi closer to the Bluetooth device
+- Check codec: `bluealsactl codec XX:XX:XX:XX:XX:XX`
+
+**Pi not discoverable from the Bluetooth device**:
+- Set infinite discoverable timeout:
+  ```bash
+  bluetoothctl discoverable-timeout 0
+  bluetoothctl discoverable on
+  ```
+- Some devices require the Pi to initiate the connection instead
+
+### Bluetooth Audio Codecs
+
+Bluetooth audio quality depends on the codec negotiated between devices:
+
+| Codec | Bitrate | Quality | Notes |
+|-------|---------|---------|-------|
+| LDAC | 990 kbps | Best | Sony proprietary, rare on non-Sony devices |
+| aptX-HD | 576 kbps | Excellent | Common on high-end turntables and speakers |
+| aptX | 352 kbps | Very Good | Common on mid-range devices |
+| AAC | 250 kbps | Good | Common on Apple devices |
+| SBC | 328 kbps | Baseline | Universal fallback, always works |
+
+To check which codec is being used:
+```bash
+bluealsactl codec XX:XX:XX:XX:XX:XX
+```
+
+The Pro-Ject T1 BT turntable supports aptX-HD for high-quality vinyl streaming.
+
+### Building BlueALSA from Source (for aptX HD support)
+
+The default Debian BlueALSA package may lack aptX-HD support or have buffer size issues with some devices. Build from source for full codec support:
+
+```bash
+# Install dependencies
+sudo apt install -y git automake libtool pkg-config libasound2-dev \
+  libbluetooth-dev libdbus-1-dev libglib2.0-dev libsbc-dev \
+  libfdk-aac-dev libopenaptx-dev
+
+# Clone and build
+cd ~
+git clone https://github.com/arkq/bluez-alsa.git
+cd bluez-alsa
+
+# Fix capabilities buffer for devices with large A2DP capabilities
+sed -i 's/a2dp_opus_pw_t opus_pw;/a2dp_opus_pw_t opus_pw;\n\tuint8_t _padding[64];/' src/shared/a2dp-codecs.h
+
+# Build with aptX HD support
+autoreconf --install
+./configure --enable-aptx --enable-aptx-hd --enable-aac --enable-systemd --with-libopenaptx
+make -j$(nproc)
+
+# Install
+sudo systemctl stop bluealsa
+sudo make install
+sudo systemctl daemon-reload
+sudo systemctl enable --now bluealsa
+```
+
+See `docs/BLUETOOTH_ALSA_EVALUATION.md` for detailed build instructions and troubleshooting.
+
 ## Protocol References
 
 - shairport-sync (C) - Production AirPlay 2 receiver
