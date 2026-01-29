@@ -39,6 +39,8 @@ pub struct AudioDecoder {
     /// Residual samples from previous decode_resampled call.
     /// Prevents discarding excess samples when source frames are larger than target packets.
     residual_samples: Vec<i16>,
+    /// High-quality sinc resampler (lazily initialized when needed).
+    resampler: Option<airplay_resampler::Resampler>,
 }
 
 impl AudioDecoder {
@@ -138,6 +140,7 @@ impl AudioDecoder {
             position_samples: 0,
             eof: false,
             residual_samples: Vec::new(),
+            resampler: None,
         })
     }
 
@@ -185,6 +188,11 @@ impl AudioDecoder {
         self.position_samples = target;
         self.eof = false;
         self.residual_samples.clear();
+
+        // Reset resampler state on seek
+        if let Some(ref mut resampler) = self.resampler {
+            resampler.reset();
+        }
 
         Ok(())
     }
@@ -262,6 +270,15 @@ impl AudioDecoder {
         let target_rate = target_format.sample_rate.as_hz();
         let source_rate = self.sample_rate;
 
+        // Initialize resampler lazily if needed
+        if source_rate != target_rate && self.resampler.is_none() {
+            self.resampler = Some(airplay_resampler::Resampler::new(
+                source_rate,
+                target_rate,
+                self.channels,
+            )?);
+        }
+
         // Start with any leftover samples from previous call
         let mut collected_samples = std::mem::take(&mut self.residual_samples);
         let target_samples = frames_per_packet * target_format.channels as usize;
@@ -272,13 +289,12 @@ impl AudioDecoder {
                     if source_rate == target_rate {
                         collected_samples.extend(frame.samples);
                     } else {
-                        // Simple linear interpolation resampling
-                        let resampled = resample_linear(
-                            &frame.samples,
-                            frame.channels,
-                            source_rate,
-                            target_rate,
-                        );
+                        // High-quality sinc resampling
+                        let resampled = self
+                            .resampler
+                            .as_mut()
+                            .expect("resampler should be initialized")
+                            .process(&frame.samples)?;
                         collected_samples.extend(resampled);
                     }
                 }
@@ -431,44 +447,6 @@ fn audio_buffer_to_i16(buffer: &AudioBufferRef) -> Vec<i16> {
             samples
         }
     }
-}
-
-/// Simple linear interpolation resampling.
-fn resample_linear(
-    samples: &[i16],
-    channels: u8,
-    source_rate: u32,
-    target_rate: u32,
-) -> Vec<i16> {
-    let ratio = source_rate as f64 / target_rate as f64;
-    let num_frames = samples.len() / channels as usize;
-    let target_frames = (num_frames as f64 / ratio).ceil() as usize;
-
-    let mut output = Vec::with_capacity(target_frames * channels as usize);
-
-    for frame in 0..target_frames {
-        let src_pos = frame as f64 * ratio;
-        let src_frame = src_pos.floor() as usize;
-        let frac = src_pos - src_frame as f64;
-
-        for ch in 0..channels as usize {
-            let idx0 = src_frame * channels as usize + ch;
-            let idx1 = ((src_frame + 1).min(num_frames - 1)) * channels as usize + ch;
-
-            if idx0 < samples.len() && idx1 < samples.len() {
-                let s0 = samples[idx0] as f64;
-                let s1 = samples[idx1] as f64;
-                let interpolated = s0 + (s1 - s0) * frac;
-                output.push(interpolated.round() as i16);
-            } else if idx0 < samples.len() {
-                output.push(samples[idx0]);
-            } else {
-                output.push(0);
-            }
-        }
-    }
-
-    output
 }
 
 #[cfg(test)]
