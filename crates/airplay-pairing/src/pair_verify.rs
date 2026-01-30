@@ -1156,6 +1156,13 @@ impl PairVerify {
     pub fn is_complete(&self) -> bool {
         self.state == PairVerifyState::Complete
     }
+
+    /// Get the ECDH shared secret (available after M2 processing).
+    ///
+    /// This can be used to derive additional keys like the stream encryption key (shk).
+    pub fn shared_secret(&self) -> Option<[u8; 32]> {
+        self.shared_secret
+    }
 }
 
 /// Mock server for testing pair-verify.

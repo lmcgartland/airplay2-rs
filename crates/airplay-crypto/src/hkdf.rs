@@ -51,6 +51,13 @@ pub mod constants {
     pub const FAIRPLAY_EKEY_INFO: &[u8] = b"AirPlay-FairPlay-EKEY";
     pub const FAIRPLAY_EIV_INFO: &[u8] = b"AirPlay-FairPlay-EIV";
     pub const FAIRPLAY_SHK_INFO: &[u8] = b"AirPlay-FairPlay-SHK";
+
+    // Fruit pairing constants (used by Apple TV)
+    // These use simple SHA-512(info || secret) derivation, not HKDF
+    pub const FRUIT_SETUP_AES_KEY: &[u8] = b"Pair-Setup-AES-Key";
+    pub const FRUIT_SETUP_AES_IV: &[u8] = b"Pair-Setup-AES-IV";
+    pub const FRUIT_VERIFY_AES_KEY: &[u8] = b"Pair-Verify-AES-Key";
+    pub const FRUIT_VERIFY_AES_IV: &[u8] = b"Pair-Verify-AES-IV";
 }
 
 /// Derive pair-setup encryption key.
@@ -87,6 +94,51 @@ pub fn derive_control_read_key(shared_secret: &[u8]) -> Result<[u8; 32], CryptoE
         constants::CONTROL_SALT,
         constants::CONTROL_READ_KEY_INFO,
     )
+}
+
+/// Simple SHA-512 hash of two byte arrays concatenated.
+/// Used by fruit pairing: SHA512(info || secret)
+pub fn hash_ab(a: &[u8], b: &[u8]) -> [u8; 64] {
+    use sha2::{Sha512, Digest};
+    let mut hasher = Sha512::new();
+    hasher.update(a);
+    hasher.update(b);
+    let result = hasher.finalize();
+    let mut output = [0u8; 64];
+    output.copy_from_slice(&result);
+    output
+}
+
+/// Derive fruit pairing setup AES key (first 16 bytes of SHA-512 hash).
+pub fn derive_fruit_setup_key(session_key: &[u8]) -> [u8; 16] {
+    let hash = hash_ab(constants::FRUIT_SETUP_AES_KEY, session_key);
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&hash[..16]);
+    key
+}
+
+/// Derive fruit pairing setup AES IV (first 16 bytes of SHA-512 hash).
+pub fn derive_fruit_setup_iv(session_key: &[u8]) -> [u8; 16] {
+    let hash = hash_ab(constants::FRUIT_SETUP_AES_IV, session_key);
+    let mut iv = [0u8; 16];
+    iv.copy_from_slice(&hash[..16]);
+    iv
+}
+
+/// Derive fruit pairing verify AES key (first 16 bytes of SHA-512 hash).
+pub fn derive_fruit_verify_key(shared_secret: &[u8]) -> [u8; 16] {
+    let hash = hash_ab(constants::FRUIT_VERIFY_AES_KEY, shared_secret);
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&hash[..16]);
+    key
+}
+
+/// Derive fruit pairing verify AES IV (first 16 bytes of SHA-512 hash).
+pub fn derive_fruit_verify_iv(shared_secret: &[u8]) -> [u8; 16] {
+    let hash = hash_ab(constants::FRUIT_VERIFY_AES_IV, shared_secret);
+    let mut iv = [0u8; 16];
+    iv.copy_from_slice(&hash[..16]);
+    iv
 }
 
 #[cfg(test)]

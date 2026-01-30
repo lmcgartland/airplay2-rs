@@ -36,10 +36,13 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("\nOptions:");
         eprintln!("  --airplay1       RAOP connection (AirPlay 1, no pairing) (default)");
         eprintln!("  --airplay2       AirPlay 2 connection (HomeKit pairing)");
+        eprintln!("  --pin PIN        Apple TV PIN pairing (HomeKit Normal, e.g., --pin 1234)");
         eprintln!("  --ptp            Use PTP timing (default: NTP)");
         eprintln!("  --ptp-master     PTP: Act as timing master (for 3rd-party receivers) (default)");
         eprintln!("  --ptp-slave      PTP: Act as timing slave (for HomePod multi-room)");
         eprintln!("  --render-delay N Render delay in ms (shifts NTP timestamps forward for retransmit headroom)");
+        eprintln!("  --device-id ID   Device ID for pair-verify (e.g., 4E:44:4C:1E:C3:B5)");
+        eprintln!("  --force-transient Force transient pairing (skip pair-verify even if identity exists)");
         std::process::exit(1);
     }
 
@@ -57,6 +60,38 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|i| args.get(i + 1))
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+
+    // Device ID for identity lookup (pair-verify)
+    // If not specified, derive from IP address for consistent identity per device
+    let device_id_str: String = args.iter()
+        .position(|a| a == "--device-id")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            // Derive device ID from IP address octets
+            match ip {
+                IpAddr::V4(v4) => {
+                    let octets = v4.octets();
+                    format!("{:02X}:{:02X}:{:02X}:{:02X}:00:00", octets[0], octets[1], octets[2], octets[3])
+                }
+                IpAddr::V6(v6) => {
+                    let segments = v6.segments();
+                    format!("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                        (segments[0] >> 8) as u8, segments[0] as u8,
+                        (segments[1] >> 8) as u8, segments[1] as u8,
+                        (segments[2] >> 8) as u8, segments[2] as u8)
+                }
+            }
+        });
+
+    // Force transient pairing (skip pair-verify)
+    let force_transient = args.iter().any(|a| a == "--force-transient");
+
+    // PIN pairing for Apple TV (accepts both --pin and legacy --fruit)
+    let pin_arg: Option<String> = args.iter()
+        .position(|a| a == "--pin" || a == "--fruit")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
 
     let timing_protocol = if use_ptp {
         TimingProtocol::Ptp
@@ -105,10 +140,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create device
     let features = Features::from_txt_value("0x4A7FCA00,0x3C354BD0").unwrap_or_default();
+    let device_id = DeviceId::from_mac_string(&device_id_str)?;
     let device = Device {
-        id: DeviceId::from_mac_string("DE:65:74:40:75:62").unwrap(),
-        name: "HomePod".to_string(),
-        model: "AudioAccessory5,1".to_string(),
+        id: device_id,
+        name: "AirPlay Device".to_string(),
+        model: "Unknown".to_string(),
         addresses: vec![ip],
         port,
         features,
@@ -145,10 +181,19 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         asc,
     };
 
-    if use_airplay2 {
+    if use_airplay2 || pin_arg.is_some() {
         // AirPlay 2 path: HomeKit pairing + encrypted RTSP
+        // Uses pair-verify if we have a saved identity, otherwise falls back to transient pairing
         println!("\n--- Connecting (AirPlay 2) ---");
-        let mut conn = Connection::connect(device, config).await?;
+        let mut conn = if let Some(ref pin) = pin_arg {
+            println!("Using PIN pairing (HomeKit Normal) with PIN: {}", pin);
+            Connection::connect_with_pin_pairing(device, config, pin).await?
+        } else if force_transient {
+            println!("Forcing transient pairing (--force-transient)");
+            Connection::connect_with_pin(device, config, "3939").await?
+        } else {
+            Connection::connect_auto(device, config, "3939").await?
+        };
         if render_delay_ms > 0 {
             conn.set_render_delay_ms(render_delay_ms);
         }

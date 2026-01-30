@@ -3,10 +3,15 @@
 //! HomeKit and FairPlay authentication for AirPlay 2.
 //!
 //! This crate implements:
-//! - HomeKit pair-setup (SRP-6a based)
-//! - HomeKit pair-verify (Curve25519 + Ed25519)
+//! - HomeKit pair-setup (SRP-6a based) - use [`PairSetup`] for Apple TV (HKP=3) or HomePod (HKP=4)
+//! - HomeKit pair-verify (Curve25519 + Ed25519) - use [`PairVerify`]
 //! - FairPlay authentication (for licensed scenarios)
-//! - Transient pairing (no persistent storage)
+//! - Transient pairing (no persistent storage) - use [`PairingSession`]
+//!
+//! ## Apple TV vs HomePod
+//!
+//! - **Apple TV**: Use [`PairSetup::new(pin)`] with HKP=3 header (HomeKit Normal)
+//! - **HomePod**: Use [`PairSetup::new_transient()`] with HKP=4 header (HomeKit Transient)
 
 mod channel;
 mod controller;

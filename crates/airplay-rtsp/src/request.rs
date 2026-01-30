@@ -187,6 +187,25 @@ impl RtspRequest {
             .body(body)
     }
 
+    /// Create a fruit pair-setup request (Apple TV pairing protocol).
+    ///
+    /// Uses binary plist content type. The body should be a binary plist dictionary.
+    pub fn fruit_pair_setup(body: Vec<u8>) -> Self {
+        Self::new(RtspMethod::Post, "/pair-setup")
+            .header("Content-Type", "application/x-apple-binary-plist")
+            .body(body)
+    }
+
+    /// Create a fruit pair-verify request (Apple TV pairing protocol).
+    ///
+    /// Uses raw binary format (no TLV8). M1 is 32-byte ECDH public key,
+    /// M3 is 64-byte encrypted signature.
+    pub fn fruit_pair_verify(body: Vec<u8>) -> Self {
+        Self::new(RtspMethod::Post, "/pair-verify")
+            .header("Content-Type", "application/octet-stream")
+            .body(body)
+    }
+
     pub fn fp_setup(body: Vec<u8>) -> Self {
         Self::new(RtspMethod::Post, "/fp-setup")
             .header("Content-Type", "application/octet-stream")

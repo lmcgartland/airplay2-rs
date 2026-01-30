@@ -1,9 +1,19 @@
-//! AES-128-CBC encryption for legacy audio.
+//! AES encryption for AirPlay.
+//!
+//! Supports:
+//! - AES-128-CBC for legacy audio (RAOP)
+//! - AES-128-GCM for fruit pair-setup phase 3
+//! - AES-128-CTR for fruit pair-verify phase 2
 
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, StreamCipher};
 use aes::Aes128;
+use aes_gcm::{Aes128Gcm, Nonce as GcmNonce, Tag};
+use aes_gcm::aead::{Aead, KeyInit as AeadKeyInit};
 use airplay_core::error::CryptoError;
+use ctr::cipher::KeyIvInit;
 use zeroize::ZeroizeOnDrop;
+
+type Aes128Ctr = ctr::Ctr64BE<Aes128>;
 
 /// AES-128-CBC cipher for legacy AirPlay 1 audio encryption.
 #[derive(ZeroizeOnDrop)]
@@ -99,7 +109,92 @@ impl AesCbcCipher {
     pub fn key(&self) -> &[u8; 16] {
         &self.key
     }
+}
 
+/// AES-128-GCM encryption for fruit pair-setup.
+///
+/// Used in pair-setup phase 3 to encrypt the client's Ed25519 public key.
+pub fn aes_gcm_encrypt(
+    plaintext: &[u8],
+    key: &[u8; 16],
+    iv: &[u8; 16],
+) -> Result<(Vec<u8>, [u8; 16]), CryptoError> {
+    let cipher = Aes128Gcm::new_from_slice(key)
+        .map_err(|e| CryptoError::Encryption(format!("AES-GCM key init failed: {}", e)))?;
+
+    // GCM uses 12-byte nonce, but fruit pairing uses 16-byte IV
+    // We increment the last byte as the nonce (matching the C code: iv[15]++)
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes.copy_from_slice(&iv[..12]);
+    // The C code increments iv[15], but GCM only uses 12 bytes
+    // We use the first 12 bytes as the nonce
+    let nonce = GcmNonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher.encrypt(nonce, plaintext)
+        .map_err(|e| CryptoError::Encryption(format!("AES-GCM encrypt failed: {}", e)))?;
+
+    // The ciphertext includes the 16-byte tag at the end
+    if ciphertext.len() < 16 {
+        return Err(CryptoError::Encryption("AES-GCM output too short".to_string()));
+    }
+
+    let tag_start = ciphertext.len() - 16;
+    let mut tag = [0u8; 16];
+    tag.copy_from_slice(&ciphertext[tag_start..]);
+
+    Ok((ciphertext[..tag_start].to_vec(), tag))
+}
+
+/// AES-128-GCM decryption for fruit pair-setup.
+pub fn aes_gcm_decrypt(
+    ciphertext: &[u8],
+    tag: &[u8; 16],
+    key: &[u8; 16],
+    iv: &[u8; 16],
+) -> Result<Vec<u8>, CryptoError> {
+    let cipher = Aes128Gcm::new_from_slice(key)
+        .map_err(|e| CryptoError::Decryption(format!("AES-GCM key init failed: {}", e)))?;
+
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes.copy_from_slice(&iv[..12]);
+    let nonce = GcmNonce::from_slice(&nonce_bytes);
+
+    // Combine ciphertext and tag for decryption
+    let mut combined = Vec::with_capacity(ciphertext.len() + 16);
+    combined.extend_from_slice(ciphertext);
+    combined.extend_from_slice(tag);
+
+    cipher.decrypt(nonce, combined.as_slice())
+        .map_err(|e| CryptoError::Decryption(format!("AES-GCM decrypt failed: {}", e)))
+}
+
+/// AES-128-CTR encryption for fruit pair-verify.
+///
+/// Used in pair-verify phase 2 to encrypt the signature.
+/// Note: CTR mode encryption and decryption are the same operation.
+pub fn aes_ctr_encrypt(
+    plaintext: &[u8],
+    key: &[u8; 16],
+    iv: &[u8; 16],
+) -> Result<Vec<u8>, CryptoError> {
+    let mut cipher = Aes128Ctr::new(key.into(), iv.into());
+    let mut output = plaintext.to_vec();
+    cipher.apply_keystream(&mut output);
+    Ok(output)
+}
+
+/// AES-128-CTR decryption for fruit pair-verify.
+///
+/// Note: CTR mode encryption and decryption are the same operation.
+pub fn aes_ctr_decrypt(
+    ciphertext: &[u8],
+    key: &[u8; 16],
+    iv: &[u8; 16],
+) -> Result<Vec<u8>, CryptoError> {
+    aes_ctr_encrypt(ciphertext, key, iv)
+}
+
+impl AesCbcCipher {
     /// RAOP encryption: only full 16-byte blocks are encrypted, trailing
     /// bytes pass through unencrypted. The IV is always reset to the
     /// original IV (stored at construction) before each call.

@@ -196,9 +196,59 @@ sudo iwconfig wlan0 power off
 sudo ./play_audio <ip> <port> <file> --airplay2
 ```
 
+## Device-Specific Pairing
+
+### HomePod (HomeKit Transient)
+
+HomePod uses **HomeKit Transient pairing** which requires no user interaction:
+
+```bash
+cargo run -p airplay-client --example play_audio -- <ip> 7000 <file> --airplay2
+```
+
+- Uses PIN `3939` (hardcoded, no on-screen PIN)
+- HKP=4 header (Transient mode)
+- M1-M4 pair-setup only (no identity registration)
+- No persistence - pairs fresh each connection
+
+### Apple TV (HomeKit Normal with PIN)
+
+Apple TV requires **HomeKit Normal pairing** with a user-entered PIN:
+
+```bash
+# 1. Trigger PIN display on Apple TV
+curl -X POST http://<ip>:7000/pair-pin-start
+
+# 2. Enter the 4-digit PIN shown on screen
+cargo run -p airplay-client --example play_audio -- <ip> 7000 <file> --pin XXXX
+
+# 3. Subsequent connections use saved identity (no PIN needed)
+cargo run -p airplay-client --example play_audio -- <ip> 7000 <file> --airplay2 --device-id <device-id>
+```
+
+- Uses user-entered PIN displayed on Apple TV screen
+- HKP=3 header (Normal mode)
+- Full M1-M6 pair-setup (registers controller identity)
+- Identity saved to `.airplay_sender_identity_<device_id>.json`
+- Future connections use pair-verify (M1-M4) with saved identity
+
+### Pairing Protocol Comparison
+
+| Feature | HomeKit Transient | HomeKit Normal |
+|---------|------------------|----------------|
+| Used by | HomePod, 3rd-party | Apple TV |
+| PIN | `3939` (fixed) | User enters from screen |
+| HKP Header | 4 | 3 |
+| Pair-Setup | M1-M4 only | Full M1-M6 |
+| Identity | Not saved | Saved to disk |
+| Subsequent | Fresh pairing | Pair-verify only |
+| Format | TLV8 | TLV8 |
+| SRP | SHA-512/3072-bit | SHA-512/3072-bit |
+
 ## Notes
 
 - **HomePod**: Works with AirPlay 2 and NTP timing (`--airplay2`). PTP timing is experimental.
+- **Apple TV**: Requires PIN pairing on first connection. Use `--pin XXXX` flag after triggering PIN with `/pair-pin-start`.
 - **Transient pairing**: HomePod and HomeKit devices accept SRP transient pairing (M1-M4) with PIN `3939`. No pair-verify step is needed afterward.
 
 ## Architecture

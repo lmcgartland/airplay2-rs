@@ -4,7 +4,7 @@ use airplay_core::{Device, StreamConfig, error::Result};
 use airplay_core::error::{Error as CoreError, RtspError};
 use airplay_core::features::AuthMethod;
 use airplay_rtsp::{RtspConnection, RtspSession, SessionState, RtspRequest};
-use airplay_pairing::{PairingSession, PairVerify, ControllerIdentity};
+use airplay_pairing::{PairingSession, PairVerify, PairSetup, ControllerIdentity};
 use airplay_crypto::ed25519::IdentityKeyPair;
 use std::path::PathBuf;
 use std::fs;
@@ -95,20 +95,49 @@ impl PersistentIdentity {
         arr.copy_from_slice(ltpk);
         Some(arr)
     }
-}
 
-fn stream_key_from_shared_secret(shared_secret: &SharedSecret) -> Result<[u8; 32]> {
-    let bytes = shared_secret.as_bytes();
-    if bytes.len() < 32 {
-        return Err(RtspError::SetupFailed(
-            "Shared secret too short for stream key".into(),
-        )
-        .into());
+    /// Create a new identity from a ControllerIdentity and optional server info.
+    fn from_controller(
+        controller: &ControllerIdentity,
+        target_device_id: &str,
+        server_ltpk: Option<[u8; 32]>,
+        server_identifier: Option<&[u8]>,
+    ) -> Self {
+        let device_id = generate_device_id();
+        let dacp_id = device_id.replace(":", "");
+        Self {
+            device_id: device_id.clone(),
+            dacp_id,
+            ed25519_secret: controller.keypair().seed().to_vec(),
+            controller_id: controller.id().to_string(),
+            server_ltpk: server_ltpk.map(|pk| pk.to_vec()),
+            server_identifier: server_identifier.map(|id| String::from_utf8_lossy(id).to_string()),
+            pair_verify_id: target_device_id.to_string(),
+        }
     }
 
-    let mut shk = [0u8; 32];
-    shk.copy_from_slice(&bytes[..32]);
-    Ok(shk)
+    /// Save identity for a target device.
+    fn save_for_device(&self, target_device_id: &str) -> bool {
+        let path = Self::identity_file_for(target_device_id);
+        match serde_json::to_string_pretty(self) {
+            Ok(json) => {
+                match fs::write(&path, json) {
+                    Ok(()) => {
+                        info!("Saved identity to {}", path.display());
+                        true
+                    }
+                    Err(e) => {
+                        warn!("Failed to save identity to {}: {}", path.display(), e);
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to serialize identity: {}", e);
+                false
+            }
+        }
+    }
 }
 
 /// Select the best address from a device's address list.
@@ -153,7 +182,6 @@ pub struct Connection {
     device: Device,
     rtsp: RtspConnection,
     session: RtspSession,
-    pairing: Option<PairingSession>,
     streamer: Option<AudioStreamer>,
     playback_state: PlaybackState,
     volume: f32,
@@ -278,7 +306,6 @@ impl Connection {
             device,
             rtsp,
             session,
-            pairing: Some(pairing),
             streamer: None,
             playback_state: PlaybackState::Stopped,
             volume: 1.0,
@@ -334,8 +361,10 @@ impl Connection {
         config: StreamConfig,
         persistent_id: &PersistentIdentity,
     ) -> Result<Self> {
-        // Use the persisted client device ID for consistency
-        let client_device_id = persistent_id.device_id.clone();
+        // Generate a FRESH random client device ID for this session (like transient pairing)
+        // The Ed25519 identity in pair-verify M3 identifies us, not the RTSP device ID
+        let client_device_id = generate_device_id();
+        debug!("Using fresh device ID for RTSP session: {}", client_device_id);
 
         // Reconstruct the controller identity
         let controller = persistent_id.to_controller().ok_or_else(|| {
@@ -436,15 +465,10 @@ impl Connection {
 
         session.set_paired()?;
 
-        // Create a dummy pairing session to satisfy the struct
-        let auth_method = AuthMethod::HomeKitTransient;
-        let pairing = PairingSession::with_identity(auth_method, identity);
-
         Ok(Self {
             device,
             rtsp,
             session,
-            pairing: Some(pairing),
             streamer: None,
             playback_state: PlaybackState::Stopped,
             volume: 1.0,
@@ -462,6 +486,211 @@ impl Connection {
             eq_config: None,
             eq_params: None,
         })
+    }
+
+    /// Connect to Apple TV using HomeKit Normal pairing with user PIN.
+    ///
+    /// This uses the standard HomeKit pairing protocol (NOT the legacy "fruit" binary plist format):
+    /// - TLV8 format (application/octet-stream)
+    /// - SHA-512/3072-bit SRP (same as HomeKit Transient)
+    /// - HKP=3 header (HomeKit Normal, vs HKP=4 for Transient)
+    /// - Full M1-M6 pair-setup flow (Transient only does M1-M4)
+    /// - Followed by M1-M4 pair-verify to establish encrypted session
+    ///
+    /// After successful pairing, the controller identity is saved to disk for future
+    /// pair-verify connections (no PIN required on subsequent connections).
+    ///
+    /// # Usage
+    /// 1. Trigger PIN display: `curl -X POST http://<ip>:7000/pair-pin-start`
+    /// 2. Enter the 4-digit PIN shown on Apple TV screen
+    /// 3. On subsequent connections, use `connect_auto()` which will use saved identity
+    ///
+    /// # Difference from HomeKit Transient
+    /// - **Normal (HKP=3)**: User PIN, M1-M6, identity saved, for Apple TV
+    /// - **Transient (HKP=4)**: PIN "3939", M1-M4 only, no persistence, for HomePod
+    pub async fn connect_with_pin_pairing(device: Device, config: StreamConfig, pin: &str) -> Result<Self> {
+        let client_device_id = generate_device_id();
+        debug!("Using fresh device ID for PIN pairing session: {}", client_device_id);
+
+        // 1. TCP connect
+        let ip_addr = select_best_address(&device.addresses)
+            .ok_or_else(|| RtspError::ConnectionRefused)?;
+        let addr = SocketAddr::new(*ip_addr, device.port);
+        info!("Connecting to {} at {} (HomeKit Normal pairing)", device.name, addr);
+
+        let mut rtsp = RtspConnection::new(addr);
+        rtsp.connect().await?;
+
+        // 2. Create session
+        let mut session = RtspSession::new(device.clone(), config.clone());
+        session.set_client_device_id(client_device_id.clone());
+        session.set_connected()?;
+        session.set_request_host(ip_addr.to_string());
+
+        let client_instance = client_device_id.replace(":", "");
+        rtsp.add_session_header("User-Agent", "AirPlay/745.83");
+        rtsp.add_session_header("X-Apple-Client-Name", "Rust AirPlay Sender");
+        rtsp.add_session_header("X-Apple-Device-ID", client_device_id.clone());
+        rtsp.add_session_header("DACP-ID", client_instance.clone());
+        rtsp.add_session_header("Client-Instance", client_instance);
+        rtsp.add_session_header("Active-Remote", "1234567890");
+
+        // 3. GET /info (required before pairing)
+        let info_req = RtspRequest::get_info();
+        let _info_resp = rtsp.send(info_req).await?;
+
+        // 4. HomeKit Normal pair-setup (M1-M6 with HKP=3)
+        // Create controller identity for consistent identifiers across pair-setup and pair-verify
+        let controller = ControllerIdentity::generate();
+        let mut pair_setup = PairSetup::new(pin);
+
+        // M1: Send pairing request (no flags for normal mode)
+        let m1 = pair_setup.generate_m1().map_err(|e| {
+            RtspError::SetupFailed(format!("Pair-setup M1 generation failed: {}", e))
+        })?;
+        debug!("Pair-setup M1: {} bytes", m1.len());
+
+        let m2_resp = rtsp.send(RtspRequest::pair_setup(m1, &client_device_id, 3)).await?;
+        let m2_body = m2_resp.body.as_deref().unwrap_or(&[]);
+        debug!("Pair-setup M2: {} bytes", m2_body.len());
+
+        pair_setup.process_m2(m2_body).map_err(|e| {
+            RtspError::SetupFailed(format!("Pair-setup M2 processing failed: {}", e))
+        })?;
+
+        // M3: Send SRP public key and proof
+        let m3 = pair_setup.generate_m3().map_err(|e| {
+            RtspError::SetupFailed(format!("Pair-setup M3 generation failed: {}", e))
+        })?;
+        debug!("Pair-setup M3: {} bytes", m3.len());
+
+        let m4_resp = rtsp.send(RtspRequest::pair_setup(m3, &client_device_id, 3)).await?;
+        let m4_body = m4_resp.body.as_deref().unwrap_or(&[]);
+        debug!("Pair-setup M4: {} bytes", m4_body.len());
+
+        pair_setup.process_m4(m4_body).map_err(|e| {
+            RtspError::SetupFailed(format!("Pair-setup M4 processing failed: {}", e))
+        })?;
+
+        // M5: Send encrypted identity (normal mode - not transient)
+        let m5 = pair_setup.generate_m5_with_controller(&controller).map_err(|e| {
+            RtspError::SetupFailed(format!("Pair-setup M5 generation failed: {}", e))
+        })?;
+        debug!("Pair-setup M5: {} bytes", m5.len());
+
+        let m6_resp = rtsp.send(RtspRequest::pair_setup(m5, &client_device_id, 3)).await?;
+        let m6_body = m6_resp.body.as_deref().unwrap_or(&[]);
+        debug!("Pair-setup M6: {} bytes", m6_body.len());
+
+        let _shared_secret = pair_setup.process_m6(m6_body).map_err(|e| {
+            RtspError::SetupFailed(format!("Pair-setup M6 processing failed: {}", e))
+        })?;
+
+        info!("HomeKit pair-setup complete (M1-M6)");
+
+        // Get server LTPK for future pair-verify
+        let server_ltpk = pair_setup.server_ltpk();
+        let server_identifier = pair_setup.server_identifier();
+
+        // Save identity for future pair-verify (skip pair-setup on next connection)
+        let target_device_id = device.id.to_mac_string();
+        let persistent = PersistentIdentity::from_controller(
+            &controller,
+            &target_device_id,
+            server_ltpk,
+            server_identifier,
+        );
+        persistent.save_for_device(&target_device_id);
+
+        // 5. Pair-verify (M1-M4) to establish encrypted session
+        let mut pair_verify = PairVerify::new_with_controller(&controller);
+
+        // Set server LTPK if available (for signature verification)
+        if let Some(ltpk) = server_ltpk {
+            pair_verify.set_server_ltpk(ltpk);
+        }
+
+        // M1: Send our ECDH public key
+        let pv_m1 = pair_verify.generate_m1().map_err(|e| {
+            RtspError::SetupFailed(format!("Pair-verify M1 generation failed: {}", e))
+        })?;
+        debug!("Pair-verify M1: {} bytes", pv_m1.len());
+
+        let pv_m2_resp = rtsp.send(RtspRequest::pair_verify(pv_m1, 3)).await?;
+        let pv_m2_body = pv_m2_resp.body.as_deref().unwrap_or(&[]);
+        debug!("Pair-verify M2: {} bytes", pv_m2_body.len());
+
+        // Process M2
+        pair_verify.process_m2(pv_m2_body).map_err(|e| {
+            RtspError::SetupFailed(format!("Pair-verify M2 processing failed: {}", e))
+        })?;
+
+        // M3: Send our signature
+        let pv_m3 = pair_verify.generate_m3().map_err(|e| {
+            RtspError::SetupFailed(format!("Pair-verify M3 generation failed: {}", e))
+        })?;
+        debug!("Pair-verify M3: {} bytes", pv_m3.len());
+
+        let pv_m4_resp = rtsp.send(RtspRequest::pair_verify(pv_m3, 3)).await?;
+        let pv_m4_body = pv_m4_resp.body.as_deref().unwrap_or(&[]);
+        debug!("Pair-verify M4: {} bytes", pv_m4_body.len());
+
+        // Process M4 and get session keys
+        let session_keys = pair_verify.process_m4(pv_m4_body).map_err(|e| {
+            RtspError::SetupFailed(format!("Pair-verify M4 processing failed: {}", e))
+        })?;
+
+        info!("Pair-verify complete, establishing encrypted session");
+
+        let cipher = ControlCipher::new(
+            *session_keys.write_key.as_bytes(),
+            *session_keys.read_key.as_bytes(),
+        );
+        rtsp.set_cipher(cipher);
+
+        // Test encrypted communication
+        match rtsp.send(RtspRequest::options()).await {
+            Ok(resp) => {
+                if let Some(public) = resp.header("Public") {
+                    info!("OPTIONS supported methods: {}", public);
+                } else {
+                    info!("OPTIONS returned {} (no Public header)", resp.status_code);
+                }
+            }
+            Err(err) => {
+                warn!("Encrypted OPTIONS request failed: {}", err);
+            }
+        }
+
+        session.set_paired()?;
+
+        Ok(Self {
+            device,
+            rtsp,
+            session,
+            streamer: None,
+            playback_state: PlaybackState::Stopped,
+            volume: 1.0,
+            stream_config: config,
+            timing_offset: None,
+            timing_tx: None,
+            timing_task: None,
+            timing_server: None,
+            ptp_master: None,
+            ptp_master_sync_task: None,
+            control_receiver: None,
+            control_task: None,
+            events_stream: None,
+            render_delay_ms: 0,
+            eq_config: None,
+            eq_params: None,
+        })
+    }
+
+    /// Deprecated alias for `connect_with_pin_pairing`.
+    #[deprecated(since = "0.2.0", note = "Use connect_with_pin_pairing instead")]
+    pub async fn connect_with_fruit_pairing(device: Device, config: StreamConfig, pin: &str) -> Result<Self> {
+        Self::connect_with_pin_pairing(device, config, pin).await
     }
 
     /// Complete RTSP SETUP phases (called before streaming).
@@ -1381,57 +1610,6 @@ mod tests {
         }
     }
 
-    mod stream_key_extraction {
-        use super::*;
-        use airplay_crypto::keys::SharedSecret;
-
-        #[test]
-        fn extracts_32_bytes_from_shared_secret() {
-            let bytes = vec![0u8; 32];
-            let secret = SharedSecret::new(bytes);
-
-            let key = stream_key_from_shared_secret(&secret).unwrap();
-            assert_eq!(key.len(), 32);
-            assert_eq!(key, [0u8; 32]);
-        }
-
-        #[test]
-        fn extracts_first_32_bytes_when_longer() {
-            let mut bytes = vec![0xFF; 64];
-            bytes[0..32].fill(0xAA);
-            bytes[32..64].fill(0xBB);
-            let secret = SharedSecret::new(bytes);
-
-            let key = stream_key_from_shared_secret(&secret).unwrap();
-            assert_eq!(key.len(), 32);
-            assert_eq!(key, [0xAA; 32]);
-        }
-
-        #[test]
-        fn fails_when_shared_secret_too_short() {
-            let bytes = vec![0u8; 16]; // Only 16 bytes
-            let secret = SharedSecret::new(bytes);
-
-            let result = stream_key_from_shared_secret(&secret);
-            assert!(result.is_err());
-
-            let err = result.unwrap_err();
-            assert!(matches!(err, CoreError::Rtsp(_)));
-        }
-
-        #[test]
-        fn fails_with_descriptive_error_message() {
-            let bytes = vec![0u8; 10];
-            let secret = SharedSecret::new(bytes);
-
-            let result = stream_key_from_shared_secret(&secret);
-            assert!(result.is_err());
-
-            let err_msg = format!("{:?}", result.unwrap_err());
-            assert!(err_msg.contains("too short") || err_msg.contains("SetupFailed"));
-        }
-    }
-
     mod address_selection {
         use super::*;
         use std::net::IpAddr;
@@ -1685,20 +1863,6 @@ mod tests {
 
     mod error_handling {
         use super::*;
-
-        #[test]
-        fn stream_key_error_type_is_correct() {
-            let bytes = vec![0u8; 10];
-            let secret = SharedSecret::new(bytes);
-
-            let result = stream_key_from_shared_secret(&secret);
-            assert!(result.is_err());
-
-            match result {
-                Err(CoreError::Rtsp(RtspError::SetupFailed(_))) => {},
-                _ => panic!("Expected RtspError::SetupFailed"),
-            }
-        }
 
         #[test]
         fn empty_address_list_returns_none() {
