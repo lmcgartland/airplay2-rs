@@ -116,6 +116,10 @@ fn monotonic_now_ns() -> u64 {
 /// On Linux, uses `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)` with
 /// SCHED_FIFO for ~10-50μs precision. On other platforms, falls back to
 /// `spin_sleep` hybrid kernel-sleep + spin-wait.
+///
+/// When `burst_size > 1`, packets are buffered and sent in bursts to reduce
+/// WiFi/Bluetooth interference on shared-radio devices (e.g., Pi Zero 2 W).
+/// For example, burst_size=4 sends 4 packets rapidly, then waits 4*frame_duration.
 fn sender_thread_main(
     rx: Receiver<SenderMessage>,
     data_socket: UdpSocket,
@@ -123,10 +127,13 @@ fn sender_thread_main(
     control_socket: Option<UdpSocket>,
     control_dest: Option<SocketAddr>,
     frame_duration: std::time::Duration,
+    burst_size: usize,
 ) {
     set_realtime_priority();
 
+    let burst_size = burst_size.max(1); // Minimum 1
     let frame_duration_ns = frame_duration.as_nanos() as u64;
+    let burst_duration_ns = frame_duration_ns * burst_size as u64;
     #[cfg(target_os = "linux")]
     let mut next_deadline_ns = monotonic_now_ns();
     #[cfg(not(target_os = "linux"))]
@@ -141,10 +148,14 @@ fn sender_thread_main(
     let mut jitter_sum_ms: f64 = 0.0;
     let mut jitter_exceed_count: u64 = 0;
 
+    // Burst buffer for WiFi/BT coexistence
+    let mut burst_buffer: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(burst_size);
+
     tracing::info!(
-        "Sender thread started: dest={}, frame_duration={:.3}ms, timing={}",
+        "Sender thread started: dest={}, frame_duration={:.3}ms, burst_size={}, timing={}",
         data_dest,
         frame_duration.as_secs_f64() * 1000.0,
+        burst_size,
         if cfg!(target_os = "linux") { "clock_nanosleep(TIMER_ABSTIME)" } else { "spin_sleep" }
     );
 
@@ -193,6 +204,14 @@ fn sender_thread_main(
                 continue;
             }
             SenderMessage::Packet { wire_data, sync_data } => {
+                // Buffer packet for burst sending
+                burst_buffer.push((wire_data, sync_data));
+
+                // Only send when we have a full burst (or first packet to initialize timing)
+                if burst_buffer.len() < burst_size && started {
+                    continue;
+                }
+
                 if !started {
                     #[cfg(target_os = "linux")]
                     { next_deadline_ns = monotonic_now_ns(); }
@@ -201,7 +220,7 @@ fn sender_thread_main(
                     last_send = std::time::Instant::now();
                     started = true;
                 } else {
-                    // Wait until the precise deadline
+                    // Wait until the precise deadline for this burst
                     #[cfg(target_os = "linux")]
                     {
                         precise_sleep_until(next_deadline_ns);
@@ -215,72 +234,76 @@ fn sender_thread_main(
                     }
                 }
 
-                // Measure actual interval and jitter
+                // Measure actual interval and jitter (for burst timing)
                 let send_time = std::time::Instant::now();
                 let actual_interval = send_time.duration_since(last_send);
                 let interval_ms = actual_interval.as_secs_f64() * 1000.0;
-                let target_ms = frame_duration.as_secs_f64() * 1000.0;
+                let target_ms = frame_duration.as_secs_f64() * 1000.0 * burst_buffer.len() as f64;
                 let jitter_ms = interval_ms - target_ms;
 
-                // Track jitter stats
-                packet_count += 1;
-                if packet_count > 1 {
+                // Track jitter stats (per burst)
+                packet_count += burst_buffer.len() as u64;
+                if packet_count > burst_size as u64 {
                     let abs_jitter = jitter_ms.abs();
                     if abs_jitter > max_jitter_ms {
                         max_jitter_ms = abs_jitter;
                     }
                     jitter_sum_ms += abs_jitter;
-                    if abs_jitter > 1.0 {
+                    if abs_jitter > 1.0 * burst_size as f64 {
                         jitter_exceed_count += 1;
                     }
 
-                    // Log every packet with >1ms jitter
-                    if abs_jitter > 1.0 {
+                    // Log burst with significant jitter
+                    if abs_jitter > 2.0 * burst_size as f64 {
                         tracing::warn!(
-                            "JITTER pkt#{}: interval={:.3}ms target={:.3}ms jitter={:+.3}ms",
-                            packet_count, interval_ms, target_ms, jitter_ms
+                            "JITTER burst#{}: interval={:.3}ms target={:.3}ms jitter={:+.3}ms",
+                            packet_count / burst_size as u64, interval_ms, target_ms, jitter_ms
                         );
                     }
 
                     // Log stats every 500 packets (~4s)
-                    if packet_count % 500 == 0 {
-                        let avg_jitter = jitter_sum_ms / (packet_count - 1) as f64;
+                    if packet_count % 500 < burst_size as u64 {
+                        let bursts = packet_count / burst_size as u64;
+                        let avg_jitter = if bursts > 1 { jitter_sum_ms / (bursts - 1) as f64 } else { 0.0 };
                         tracing::info!(
-                            "TIMING STATS after {} pkts: avg_jitter={:.3}ms max_jitter={:.3}ms exceeds_1ms={}",
-                            packet_count, avg_jitter, max_jitter_ms, jitter_exceed_count
+                            "TIMING STATS after {} pkts ({} bursts): avg_jitter={:.3}ms max_jitter={:.3}ms exceeds={}",
+                            packet_count, bursts, avg_jitter, max_jitter_ms, jitter_exceed_count
                         );
                     }
                 }
 
                 last_send = send_time;
 
-                // Send sync packet first if needed
-                if let Some(sync) = sync_data {
-                    if let Some(ref ctrl_sock) = control_socket {
-                        let dest = control_dest.unwrap_or(data_dest);
-                        if let Err(e) = ctrl_sock.send_to(&sync, dest) {
-                            tracing::error!("Failed to send sync packet: {}", e);
+                // Send all buffered packets rapidly (no sleep between packets in burst)
+                for (wire_data, sync_data) in burst_buffer.drain(..) {
+                    // Send sync packet first if needed
+                    if let Some(sync) = sync_data {
+                        if let Some(ref ctrl_sock) = control_socket {
+                            let dest = control_dest.unwrap_or(data_dest);
+                            if let Err(e) = ctrl_sock.send_to(&sync, dest) {
+                                tracing::error!("Failed to send sync packet: {}", e);
+                            }
+                        } else {
+                            let dest = control_dest.unwrap_or(data_dest);
+                            if let Err(e) = data_socket.send_to(&sync, dest) {
+                                tracing::error!("Failed to send sync packet (data socket): {}", e);
+                            }
                         }
-                    } else {
-                        let dest = control_dest.unwrap_or(data_dest);
-                        if let Err(e) = data_socket.send_to(&sync, dest) {
-                            tracing::error!("Failed to send sync packet (data socket): {}", e);
-                        }
+                    }
+
+                    // Send audio packet
+                    if let Err(e) = data_socket.send_to(&wire_data, data_dest) {
+                        tracing::error!("Failed to send audio packet: {}", e);
                     }
                 }
 
-                // Send audio packet
-                if let Err(e) = data_socket.send_to(&wire_data, data_dest) {
-                    tracing::error!("Failed to send audio packet: {}", e);
-                }
-
-                // Advance deadline
+                // Advance deadline by burst duration
                 #[cfg(target_os = "linux")]
                 {
-                    next_deadline_ns += frame_duration_ns;
-                    // Catch up if we've fallen behind by more than one frame
+                    next_deadline_ns += burst_duration_ns;
+                    // Catch up if we've fallen behind by more than one burst
                     let now_ns = monotonic_now_ns();
-                    if now_ns > next_deadline_ns + frame_duration_ns {
+                    if now_ns > next_deadline_ns + burst_duration_ns {
                         tracing::warn!(
                             "Sender thread fell behind by {:.2}ms, resetting deadline",
                             (now_ns - next_deadline_ns) as f64 / 1_000_000.0
@@ -290,9 +313,9 @@ fn sender_thread_main(
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    next_deadline += frame_duration;
+                    next_deadline += frame_duration * burst_size as u32;
                     let now = std::time::Instant::now();
-                    if now > next_deadline + frame_duration {
+                    if now > next_deadline + frame_duration * burst_size as u32 {
                         tracing::warn!(
                             "Sender thread fell behind by {:.2}ms, resetting deadline",
                             (now - next_deadline).as_secs_f64() * 1000.0
@@ -478,6 +501,13 @@ impl AudioStreamer {
                             None => (None, None),
                         };
 
+                        // Burst size for WiFi/BT coexistence: send N packets rapidly, then wait.
+                        // Creates gaps for Bluetooth to transmit cleanly.
+                        // - burst_size=1: no bursting (original behavior)
+                        // - burst_size=2: 16ms gaps
+                        // - burst_size=4: 32ms gaps (may cause burst packet loss)
+                        let burst_size = 2;
+
                         let thread = std::thread::Builder::new()
                             .name("rt-sender".into())
                             .spawn(move || {
@@ -488,6 +518,7 @@ impl AudioStreamer {
                                     ctrl_sock,
                                     ctrl_dest,
                                     frame_duration,
+                                    burst_size,
                                 );
                             })
                             .expect("Failed to spawn sender thread");
@@ -603,6 +634,13 @@ impl AudioStreamer {
                             None => (None, None),
                         };
 
+                        // Burst size for WiFi/BT coexistence: send N packets rapidly, then wait.
+                        // Creates gaps for Bluetooth to transmit cleanly.
+                        // - burst_size=1: no bursting (original behavior)
+                        // - burst_size=2: 16ms gaps
+                        // - burst_size=4: 32ms gaps (may cause burst packet loss)
+                        let burst_size = 2;
+
                         let thread = std::thread::Builder::new()
                             .name("rt-sender".into())
                             .spawn(move || {
@@ -613,6 +651,7 @@ impl AudioStreamer {
                                     ctrl_sock,
                                     ctrl_dest,
                                     frame_duration,
+                                    burst_size,
                                 );
                             })
                             .expect("Failed to spawn sender thread");

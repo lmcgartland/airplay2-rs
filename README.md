@@ -186,15 +186,77 @@ The audio streamer is optimized for low-jitter playback on resource-constrained 
 - **Retransmit handling** for UDP packet loss — parses Apple's 8-byte compact retransmit request format and responds within 5ms
 - **DSCP EF marking** on audio sockets for WiFi WMM Voice priority
 
-### Recommended Pi setup for best audio quality
+### Required OS Tuning (run once after each boot)
+
+These settings are critical for dropout-free audio streaming:
 
 ```bash
-# Disable WiFi power management (prevents radio sleep between packets)
-sudo iwconfig wlan0 power off
+# 1. Set CPU governor to 'performance' (prevents frequency scaling jitter)
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 
-# Run with root for SCHED_FIFO real-time priority
-sudo ./play_audio <ip> <port> <file> --airplay2
+# 2. Grant real-time scheduling capability to the binary (avoids needing root)
+sudo setcap cap_sys_nice+ep ~/airplay-tui
+
+# 3. Reduce swap pressure (prevents memory thrashing on low-RAM Pis)
+sudo sysctl -w vm.swappiness=10
+
+# 4. Disable WiFi power management (prevents radio sleep between packets)
+sudo iwconfig wlan0 power off
 ```
+
+To make settings 1, 3, and 4 persist across reboots:
+
+```bash
+# /etc/rc.local or a systemd service
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=10
+iwconfig wlan0 power off
+```
+
+### Verify Real-time Priority is Working
+
+After running with the capability set, check that SCHED_FIFO is active:
+
+```bash
+# While streaming, check the rt-sender thread
+ps -eo pid,ni,rtprio,comm | grep airplay
+# Should show rtprio=50 for the rt-sender thread
+```
+
+If `rtprio` shows `-`, the capability wasn't set correctly. Re-run `setcap` after each deploy.
+
+### Recommended Runtime Options
+
+```bash
+# With render delay (gives receiver 200ms buffer for retransmit recovery)
+./airplay-tui --render-delay 200
+
+# With debug logging to diagnose jitter
+./airplay-tui --debug --log-file ~/airplay-debug.log
+```
+
+### WiFi/Bluetooth Coexistence (Pi Zero 2 W)
+
+The Pi Zero 2 W uses a shared WiFi/Bluetooth radio (BCM43430). When streaming
+Bluetooth audio to AirPlay simultaneously, radio interference can cause crackling.
+
+**Diagnosing the issue:**
+```bash
+cat /proc/net/wireless
+# High 'retry' count (>1000) indicates WiFi/BT interference
+```
+
+**Built-in mitigation - Packet Bursting:**
+
+The sender uses burst mode by default: instead of sending packets every ~8ms,
+it sends 4 packets rapidly then waits ~32ms. This creates gaps for Bluetooth
+to transmit cleanly, reducing collisions.
+
+**Additional mitigations if crackling persists:**
+- Use a USB Ethernet adapter (eliminates WiFi entirely)
+- Move the Pi closer to the WiFi router
+- Use SBC Bluetooth codec instead of aptX-HD (less BT bandwidth)
+- Reduce other 2.4GHz interference (microwaves, other WiFi networks)
 
 ## Device-Specific Pairing
 
@@ -447,9 +509,10 @@ cargo build -p airplay-tui --features bluetooth --release
 - Disable PipeWire's bluez monitor (see setup instructions above)
 
 **Poor audio quality / dropouts**:
-- Disable WiFi power management: `sudo iwconfig wlan0 power off`
+- Apply all OS tuning from the "Real-time Audio on Raspberry Pi" section above
 - Move the Pi closer to the Bluetooth device
 - Check codec: `bluealsactl codec XX:XX:XX:XX:XX:XX`
+- Reduce memory pressure: `sudo sysctl -w vm.swappiness=10`
 
 **Pi not discoverable from the Bluetooth device**:
 - Set infinite discoverable timeout:
