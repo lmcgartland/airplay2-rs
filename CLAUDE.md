@@ -6,7 +6,7 @@ Building an open-source AirPlay 2 audio transmitter (sender) in Rust. The goal i
 
 **Key constraint:** Use HomeKit transient pairing to bypass MFi requirements. This works because devices with feature bit 51 (SupportsUnifiedPairSetupAndMFi) WITHOUT bit 26 (Authentication_8) accept software-only authentication.
 
-PTP Timing currently does not work. You must use NTP for RTP timing or audio will not play.
+**PTP Timing:** Works via BMCA yield flow (Mac-style). The sender sends 3 Syncs with Priority1=250, yields to HomePod (Priority1=248), then syncs as slave. Uses PT=87 sync packets (28 bytes, PTP clock time + master clock ID) instead of PT=84 NTP sync. Test with: `sudo cargo run --example test_gptp -- <ip> 7000 <audio-file>`
 
 ## Spec Reference
 

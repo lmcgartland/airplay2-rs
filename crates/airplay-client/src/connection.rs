@@ -19,7 +19,7 @@ use airplay_crypto::keys::SharedSecret;
 use crate::PlaybackState;
 use std::net::{IpAddr, SocketAddr};
 use tracing::{debug, info, warn};
-use airplay_timing::{NtpTimingServer, ClockOffset, PtpMaster, PTP_EVENT_PORT, PTP_GENERAL_PORT, run_ptp_slave};
+use airplay_timing::{NtpTimingServer, ClockOffset, PtpMaster, PTP_EVENT_PORT, run_ptp_slave, run_bmca_yield_flow};
 use airplay_core::stream::TimingProtocol;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -199,6 +199,8 @@ pub struct Connection {
     control_receiver: Option<Arc<RtpReceiver>>,
     /// Reverse connection to device's events port (required before RECORD)
     events_stream: Option<TcpStream>,
+    /// Remote PTP master clock identity (from BMCA yield flow)
+    ptp_master_clock_id: Option<[u8; 8]>,
     /// Render delay in ms added to NTP timestamps for extra retransmit headroom.
     render_delay_ms: u32,
     /// Equalizer configuration (set before streaming).
@@ -316,6 +318,7 @@ impl Connection {
             timing_server: None,
             ptp_master: None,
             ptp_master_sync_task: None,
+            ptp_master_clock_id: None,
             control_receiver: None,
             control_task: None,
             events_stream: None,
@@ -479,6 +482,7 @@ impl Connection {
             timing_server: None,
             ptp_master: None,
             ptp_master_sync_task: None,
+            ptp_master_clock_id: None,
             control_receiver: None,
             control_task: None,
             events_stream: None,
@@ -678,6 +682,7 @@ impl Connection {
             timing_server: None,
             ptp_master: None,
             ptp_master_sync_task: None,
+            ptp_master_clock_id: None,
             control_receiver: None,
             control_task: None,
             events_stream: None,
@@ -852,116 +857,53 @@ impl Connection {
             TimingProtocol::Ptp => {
                 match self.stream_config.ptp_mode {
                     airplay_core::PtpMode::Master => {
-                        // Master mode with bidirectional gPTP: sync TO HomePod's clock
+                        // BMCA yield flow: act like a Mac sender
+                        // 1. Send 3 Syncs + Announces with Priority1=250
+                        // 2. HomePod wins BMCA (Priority1=248 < 250)
+                        // 3. We yield and become slave
+                        // 4. Receive Sync/Follow_Up from HomePod, calculate offset
                         let (offset_tx, mut offset_rx) = watch::channel(ClockOffset::default());
                         self.timing_tx = Some(offset_tx.clone());
 
-                        // Start PTP master (binds ports 319/320, calculates offset from HomePod)
-                        let mut ptp_master = PtpMaster::new();
-                        ptp_master.set_offset_sender(offset_tx);
-                        match ptp_master.start().await {
-                            Ok(()) => {
-                                tracing::info!("PTP master started on ports 319/320");
+                        // Oneshot channel to receive HomePod's clock identity from BMCA
+                        let (clock_id_tx, clock_id_rx) = tokio::sync::oneshot::channel::<[u8; 8]>();
 
-                                // Get references to the sockets for the sync loop
-                                let event_socket = ptp_master.event_socket().cloned();
-                                let general_socket = ptp_master.general_socket().cloned();
-                                let clock_identity = ptp_master.clock_identity();
-
-                                // Spawn background task to send Sync every ~200ms to the HomePod
-                                // CRITICAL: PTP uses TWO different ports:
-                                // - Event port 319: for Sync messages (time-critical)
-                                // - General port 320: for Announce messages (non-time-critical)
-                                let event_addr = SocketAddr::new(addr, PTP_EVENT_PORT);
-                                let general_addr = SocketAddr::new(addr, PTP_GENERAL_PORT);
-                                if let (Some(evt), Some(gen)) = (event_socket, general_socket) {
-                                    tracing::info!("Spawning gPTP sync loop: event={}, general={}", event_addr, general_addr);
-                                    self.ptp_master_sync_task = Some(tokio::spawn(async move {
-                                        tracing::info!("gPTP master loop started: event={}, general={}", event_addr, general_addr);
-                                        let mut sync_seq: u16 = 0;
-                                        let mut announce_seq: u16 = 0;
-                                        let mut signaling_seq: u16 = 0;
-                                        let mut sync_count: u32 = 0;
-
-                                        // gPTP timing intervals (802.1AS)
-                                        const SYNC_INTERVAL_MS: u64 = 125;      // 125ms = 2^-3 seconds (logInterval: -3)
-                                        const ANNOUNCE_INTERVAL_MS: u64 = 250;  // 250ms = 2^-2 seconds (logInterval: -2)
-
-                                        // Initial gPTP negotiation: Send Announce + Signaling
-                                        tracing::info!("gPTP: Starting negotiation handshake");
-                                        if let Err(e) = airplay_timing::send_ptp_announce(
-                                            &gen, general_addr, &clock_identity, &mut announce_seq, 193,
-                                        ).await {
-                                            tracing::error!("Failed to send initial Announce: {}", e);
-                                        }
-
-                                        if let Err(e) = airplay_timing::send_ptp_signaling(
-                                            &gen, general_addr, &clock_identity, &mut signaling_seq,
-                                            -3,  // Sync interval: 2^-3 = 125ms
-                                            -2,  // Announce interval: 2^-2 = 250ms
-                                        ).await {
-                                            tracing::error!("Failed to send initial Signaling: {}", e);
-                                        }
-
-                                        tracing::info!("gPTP: Negotiation complete, starting sync loop");
-
-                                        // Main sync loop with gPTP intervals
-                                        let mut sync_interval = tokio::time::interval(std::time::Duration::from_millis(SYNC_INTERVAL_MS));
-                                        let mut announce_interval = tokio::time::interval(std::time::Duration::from_millis(ANNOUNCE_INTERVAL_MS));
-
-                                        loop {
-                                            tokio::select! {
-                                                _ = sync_interval.tick() => {
-                                                    // Send Sync + Follow_Up every 125ms
-                                                    match airplay_timing::send_ptp_sync(
-                                                        &evt, &gen, event_addr, &clock_identity, &mut sync_seq,
-                                                    ).await {
-                                                        Ok(()) => {
-                                                            sync_count += 1;
-                                                            if sync_count % 40 == 0 {
-                                                                tracing::info!("gPTP: Sent {} Sync messages (latest seq={})", sync_count, sync_seq);
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::warn!("gPTP sync send error: {}", e);
-                                                        }
-                                                    }
-                                                }
-                                                _ = announce_interval.tick() => {
-                                                    // Send Announce every 250ms
-                                                    match airplay_timing::send_ptp_announce(
-                                                        &gen, general_addr, &clock_identity, &mut announce_seq, 193,
-                                                    ).await {
-                                                        Ok(()) => {
-                                                            tracing::debug!("gPTP Announce sent to {} (seq={})", general_addr, announce_seq);
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::warn!("gPTP Announce send error: {}", e);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }));
-                                } else {
-                                    tracing::warn!("PTP master sockets not available - sync loop not started");
-                                }
-
-                                self.ptp_master = Some(ptp_master);
-
-                                // Wait briefly for initial gPTP negotiation and offset calculation
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-                                // Get initial offset from watch channel
-                                let initial_offset = *offset_rx.borrow_and_update();
-                                self.timing_offset = Some(initial_offset);
-
-                                tracing::info!("gPTP master initialized (syncing TO HomePod, initial offset: {} ns)", initial_offset.offset_ns);
+                        let master_ip = addr;
+                        self.ptp_master_sync_task = Some(tokio::spawn(async move {
+                            if let Err(e) = run_bmca_yield_flow(
+                                master_ip,
+                                250,  // Priority1=250 (Mac's value, loses to HomePod's 248)
+                                offset_tx,
+                                clock_id_tx,
+                            ).await {
+                                tracing::error!("BMCA yield flow error: {}", e);
                             }
-                            Err(e) => {
-                                warn!("Failed to start PTP master (continuing without PTP): {}", e);
+                        }));
+
+                        // Wait for BMCA to complete and get HomePod's clock identity
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            clock_id_rx,
+                        ).await {
+                            Ok(Ok(clock_id)) => {
+                                self.ptp_master_clock_id = Some(clock_id);
+                                tracing::info!("BMCA complete: HomePod clock ID = {:02x?}", clock_id);
+                            }
+                            Ok(Err(_)) => {
+                                tracing::warn!("BMCA: clock ID channel closed unexpectedly");
+                            }
+                            Err(_) => {
+                                tracing::warn!("BMCA: timeout waiting for clock ID (5s)");
                             }
                         }
+
+                        // Wait briefly for initial offset calculation
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        let initial_offset = *offset_rx.borrow_and_update();
+                        self.timing_offset = Some(initial_offset);
+
+                        tracing::info!("gPTP BMCA initialized (offset: {} ns, clock_id: {:02x?})",
+                            initial_offset.offset_ns, self.ptp_master_clock_id);
                     }
                     airplay_core::PtpMode::Slave => {
                         // Slave mode: Receiver (HomePod) is the timing master
@@ -1133,8 +1075,12 @@ impl Connection {
         if let Some(ref tx) = self.timing_tx {
             streamer.set_timing_updates(tx.subscribe()).await;
         }
-        // As PTP master, our clock is the reference - offset is always 0.
-        // No watch::Receiver needed (timing_offset was set to default in setup).
+        // Enable PTP sync mode (PT=87) if we have a remote clock ID from BMCA
+        if self.stream_config.timing_protocol == TimingProtocol::Ptp {
+            if let Some(clock_id) = self.ptp_master_clock_id {
+                streamer.set_ptp_sync_mode(clock_id).await;
+            }
+        }
 
         // Set up equalizer if configured
         if let (Some(config), Some(params)) = (self.eq_config.take(), self.eq_params.clone()) {

@@ -1056,6 +1056,7 @@ pub async fn send_ptp_announce(
     clock_identity: &[u8; 8],
     announce_seq: &mut u16,
     clock_class: u8,  // 193 = master, 248+ = slave
+    priority1: u8,    // BMCA priority: lower wins. Mac=250, HomePod=248
 ) -> Result<()> {
     *announce_seq = announce_seq.wrapping_add(1);
     let seq = *announce_seq;
@@ -1079,8 +1080,8 @@ pub async fn send_ptp_announce(
     // Bytes 44-45: currentUtcOffset (i16 BE) — 37 seconds (TAI - UTC as of 2017+)
     packet[44..46].copy_from_slice(&37i16.to_be_bytes());
     // Byte 46: reserved
-    // Byte 47: grandmasterPriority1 — 128 (default)
-    packet[47] = 128;
+    // Byte 47: grandmasterPriority1 — lower wins BMCA
+    packet[47] = priority1;
     // Bytes 48-51: grandmasterClockQuality (4 bytes)
     //   Byte 48: clockClass — 193 (master), 248+ (slave)
     //   Lower number = better clock, wins BMCA election
@@ -1257,6 +1258,321 @@ pub async fn send_ptp_sync(
     Ok(())
 }
 
+/// Send Mac-style gPTP Signaling with Apple TLVs using `0x2710` values.
+///
+/// The Mac uses different Apple TLV payloads than HomePod. Key difference:
+/// HomePod sends `0x0301` version values, Mac sends `0x2710` (10000) values.
+pub async fn send_mac_style_signaling(
+    general_socket: &tokio::net::UdpSocket,
+    dest: std::net::SocketAddr,
+    clock_identity: &[u8; 8],
+    sequence_id: &mut u16,
+) -> Result<()> {
+    *sequence_id = sequence_id.wrapping_add(1);
+    let seq = *sequence_id;
+
+    let mut source_port_identity = [0u8; 10];
+    source_port_identity[..8].copy_from_slice(clock_identity);
+    source_port_identity[8..10].copy_from_slice(&1u16.to_be_bytes());
+
+    let mut header = PtpHeader::new(PtpMessageType::Signaling, seq);
+    header.source_port_identity = source_port_identity;
+
+    // 802.1AS Message Interval Request TLV
+    let tlv = MessageIntervalRequestTlv::new(-3, -2);
+    let tlv_bytes = tlv.serialize();
+
+    // Apple TLV 0x01 with Mac format (0x2710 values, not 0x0301)
+    let apple_tlv_01_payload = vec![
+        0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x27, 0x10,
+        0x00, 0x00, 0x27, 0x10, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let apple_tlv_01 = AppleTlv::new([0x00, 0x00, 0x01], apple_tlv_01_payload);
+    let apple_tlv_01_bytes = apple_tlv_01.serialize();
+
+    // Apple TLV 0x05 with Mac format (0x2710 values)
+    let apple_tlv_05_payload = vec![
+        0x00, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x27, 0x10,
+        0x00, 0x00, 0x27, 0x10, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    ];
+    let apple_tlv_05 = AppleTlv::new([0x00, 0x00, 0x05], apple_tlv_05_payload);
+    let apple_tlv_05_bytes = apple_tlv_05.serialize();
+
+    header.message_length = 34 + 10 + tlv_bytes.len() as u16
+        + apple_tlv_01_bytes.len() as u16
+        + apple_tlv_05_bytes.len() as u16;
+
+    let mut packet = Vec::new();
+    packet.extend_from_slice(&header.serialize());
+    packet.extend_from_slice(&[0xFF; 10]); // Target port identity: wildcard
+    packet.extend_from_slice(&tlv_bytes);
+    packet.extend_from_slice(&apple_tlv_01_bytes);
+    packet.extend_from_slice(&apple_tlv_05_bytes);
+
+    let general_dest = std::net::SocketAddr::new(dest.ip(), PTP_GENERAL_PORT);
+    general_socket.send_to(&packet, general_dest).await?;
+    tracing::info!("gPTP: Sent Mac-style Signaling to {} (seq={}, Apple TLVs with 0x2710)", general_dest, seq);
+
+    Ok(())
+}
+
+/// Send stop Signaling (802.1AS Message Interval Request with all intervals = 0x7E).
+///
+/// 0x7E (126) means "stop sending". This is sent when yielding master role
+/// to the remote device during BMCA.
+pub async fn send_stop_signaling(
+    general_socket: &tokio::net::UdpSocket,
+    dest: std::net::SocketAddr,
+    clock_identity: &[u8; 8],
+    sequence_id: &mut u16,
+) -> Result<()> {
+    *sequence_id = sequence_id.wrapping_add(1);
+    let seq = *sequence_id;
+
+    let mut source_port_identity = [0u8; 10];
+    source_port_identity[..8].copy_from_slice(clock_identity);
+    source_port_identity[8..10].copy_from_slice(&1u16.to_be_bytes());
+
+    let mut header = PtpHeader::new(PtpMessageType::Signaling, seq);
+    header.source_port_identity = source_port_identity;
+
+    // 802.1AS Message Interval Request with all intervals = 0x7E (stop)
+    let stop_tlv = MessageIntervalRequestTlv {
+        organization_id: org_id::GPTP,
+        organization_subtype: gptp_subtype::MESSAGE_INTERVAL_REQUEST,
+        link_delay_interval: 0x7E,
+        time_sync_interval: 0x7E,
+        announce_interval: 0x7E,
+        flags: 0x00,
+    };
+    let tlv_bytes = stop_tlv.serialize();
+
+    header.message_length = 34 + 10 + tlv_bytes.len() as u16;
+
+    let mut packet = Vec::new();
+    packet.extend_from_slice(&header.serialize());
+    packet.extend_from_slice(&[0xFF; 10]); // Target port identity: wildcard
+    packet.extend_from_slice(&tlv_bytes);
+
+    let general_dest = std::net::SocketAddr::new(dest.ip(), PTP_GENERAL_PORT);
+    general_socket.send_to(&packet, general_dest).await?;
+    tracing::info!("gPTP: Sent STOP Signaling to {} (seq={}, all intervals=0x7E)", general_dest, seq);
+
+    Ok(())
+}
+
+/// Run BMCA yield flow: act like a Mac sender.
+///
+/// 1. Send 3 Syncs + 2 Announces (Priority1=250) + Mac-style Signaling
+/// 2. Listen for HomePod's Announce, extract Priority1 + clock identity
+/// 3. If HomePod wins (lower Priority1): send stop Signaling, become slave
+/// 4. Slave loop: Sync → Follow_Up → Delay_Req → Delay_Resp → offset calculation
+///
+/// The remote clock identity is sent via `clock_id_tx` once BMCA completes.
+pub async fn run_bmca_yield_flow(
+    master_ip: std::net::IpAddr,
+    priority1: u8,
+    offset_tx: tokio::sync::watch::Sender<ClockOffset>,
+    clock_id_tx: tokio::sync::oneshot::Sender<[u8; 8]>,
+) -> Result<()> {
+    use tokio::net::UdpSocket;
+
+    // Bind to PTP ports (privileged, fall back to ephemeral)
+    let event_socket = match UdpSocket::bind(("0.0.0.0", PTP_EVENT_PORT)).await {
+        Ok(s) => {
+            tracing::info!("BMCA: bound to event port {}", PTP_EVENT_PORT);
+            s
+        }
+        Err(_) => {
+            let s = UdpSocket::bind("0.0.0.0:0").await?;
+            tracing::warn!("BMCA: using ephemeral event port {}", s.local_addr()?.port());
+            s
+        }
+    };
+
+    let general_socket = match UdpSocket::bind(("0.0.0.0", PTP_GENERAL_PORT)).await {
+        Ok(s) => {
+            tracing::info!("BMCA: bound to general port {}", PTP_GENERAL_PORT);
+            s
+        }
+        Err(_) => {
+            let s = UdpSocket::bind("0.0.0.0:0").await?;
+            tracing::warn!("BMCA: using ephemeral general port {}", s.local_addr()?.port());
+            s
+        }
+    };
+
+    let event_dest = std::net::SocketAddr::new(master_ip, PTP_EVENT_PORT);
+    let general_dest = std::net::SocketAddr::new(master_ip, PTP_GENERAL_PORT);
+
+    // Generate clock identity
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let clock_identity = (now as u64).to_be_bytes();
+
+    let mut sync_seq: u16 = 0;
+    let mut announce_seq: u16 = 0;
+    let mut signaling_seq: u16 = 0;
+
+    tracing::info!("BMCA: Starting Mac-style negotiation with {} (our priority1={})", master_ip, priority1);
+
+    // Phase 1: Send 3 Syncs + 2 Announces + Mac-style Signaling (like Mac does)
+    for i in 0..3 {
+        send_ptp_sync(&event_socket, &general_socket, event_dest, &clock_identity, &mut sync_seq).await?;
+        if i < 2 {
+            send_ptp_announce(&general_socket, general_dest, &clock_identity, &mut announce_seq, 248, priority1).await?;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(125)).await;
+    }
+    send_mac_style_signaling(&general_socket, general_dest, &clock_identity, &mut signaling_seq).await?;
+
+    tracing::info!("BMCA: Initial messages sent, waiting for remote Announce...");
+
+    // Phase 2: Listen for remote Announce to get their Priority1 + clock identity
+    let mut remote_clock_id = [0u8; 8];
+    let mut remote_priority1: u8 = 255;
+    let mut general_buf = [0u8; 256];
+    let mut event_buf = [0u8; 256];
+    let bmca_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(bmca_deadline) => {
+                tracing::warn!("BMCA: Timeout waiting for remote Announce, proceeding as slave anyway");
+                break;
+            }
+            result = general_socket.recv_from(&mut general_buf) => {
+                if let Ok((len, _src)) = result {
+                    if let Ok(header) = PtpHeader::parse(&general_buf[..len]) {
+                        if header.message_type == PtpMessageType::Announce && len >= 61 {
+                            remote_priority1 = general_buf[47];
+                            remote_clock_id.copy_from_slice(&general_buf[53..61]);
+                            tracing::info!("BMCA: Received Announce from remote: priority1={}, clock_id={:02x?}",
+                                remote_priority1, remote_clock_id);
+                            break;
+                        }
+                    }
+                }
+            }
+            // Also drain event port during BMCA phase
+            result = event_socket.recv_from(&mut event_buf) => {
+                if let Ok((len, _src)) = result {
+                    if let Ok(header) = PtpHeader::parse(&event_buf[..len]) {
+                        tracing::debug!("BMCA: Received {:?} on event port during negotiation", header.message_type);
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 3: BMCA decision — lower priority1 wins master
+    let we_are_master = priority1 < remote_priority1;
+    tracing::info!("BMCA: Decision — our_p1={}, remote_p1={}, we_are_master={}",
+        priority1, remote_priority1, we_are_master);
+
+    if !we_are_master {
+        // Yield: send stop Signaling, transition to slave
+        send_stop_signaling(&general_socket, general_dest, &clock_identity, &mut signaling_seq).await?;
+        tracing::info!("BMCA: Yielded master to remote, transitioning to slave mode");
+    }
+
+    // Report remote clock identity to caller
+    let _ = clock_id_tx.send(remote_clock_id);
+
+    // Phase 4: Slave loop (receive Sync/Follow_Up, send Delay_Req, calculate offset)
+    let mut t1: Option<PtpTimestamp> = None;
+    let mut t2: Option<PtpTimestamp> = None;
+    let mut t3: Option<PtpTimestamp> = None;
+    let mut delay_req_seq: u16 = 0;
+
+    tracing::info!("BMCA: Entering slave loop, syncing to remote clock");
+
+    loop {
+        tokio::select! {
+            result = event_socket.recv_from(&mut event_buf) => {
+                if let Ok((len, _src)) = result {
+                    if let Ok(header) = PtpHeader::parse(&event_buf[..len]) {
+                        match header.message_type {
+                            PtpMessageType::Sync => {
+                                t2 = Some(PtpTimestamp::now());
+                                tracing::trace!("BMCA slave: Received Sync (seq={})", header.sequence_id);
+                            }
+                            PtpMessageType::DelayResp => {
+                                if len >= 44 {
+                                    if let Ok(t4) = PtpTimestamp::parse(&event_buf[34..44]) {
+                                        if let (Some(t1v), Some(t2v), Some(t3v)) = (t1, t2, t3) {
+                                            let t1_ns = t1v.to_nanos() as i128;
+                                            let t2_ns = t2v.to_nanos() as i128;
+                                            let t3_ns = t3v.to_nanos() as i128;
+                                            let t4_ns = t4.to_nanos() as i128;
+
+                                            let offset_val = ((t2_ns - t1_ns) + (t3_ns - t4_ns)) / 2;
+                                            let delay = ((t2_ns - t1_ns) - (t3_ns - t4_ns)) / 2;
+
+                                            let clock_offset = ClockOffset {
+                                                offset_ns: offset_val as i64,
+                                                error_ns: (delay.abs() / 2) as u64,
+                                                rtt_ns: delay.abs() as u64,
+                                            };
+
+                                            tracing::debug!(
+                                                "BMCA slave: synchronized offset={}ns, delay={}ns",
+                                                clock_offset.offset_ns, clock_offset.rtt_ns
+                                            );
+                                            let _ = offset_tx.send(clock_offset);
+                                        }
+                                        t1 = None;
+                                        t2 = None;
+                                        t3 = None;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            result = general_socket.recv_from(&mut general_buf) => {
+                if let Ok((len, _src)) = result {
+                    if let Ok(header) = PtpHeader::parse(&general_buf[..len]) {
+                        if header.message_type == PtpMessageType::FollowUp && len >= 44 {
+                            if let Ok(ts) = PtpTimestamp::parse(&general_buf[34..44]) {
+                                t1 = Some(ts);
+                                tracing::trace!("BMCA slave: Received Follow_Up (seq={}, t1={}.{:09}s)",
+                                    header.sequence_id, ts.seconds, ts.nanoseconds);
+
+                                // Send Delay_Req
+                                delay_req_seq = delay_req_seq.wrapping_add(1);
+                                let mut delay_header = PtpHeader::new(PtpMessageType::DelayReq, delay_req_seq);
+                                let mut delay_src_port = [0u8; 10];
+                                delay_src_port[..8].copy_from_slice(&clock_identity);
+                                delay_src_port[8..10].copy_from_slice(&1u16.to_be_bytes());
+                                delay_header.source_port_identity = delay_src_port;
+
+                                t3 = Some(PtpTimestamp::now());
+
+                                let mut delay_packet = [0u8; 44];
+                                delay_packet[..34].copy_from_slice(&delay_header.serialize());
+                                delay_packet[34..44].copy_from_slice(&t3.unwrap().serialize());
+
+                                if let Err(e) = event_socket.send_to(&delay_packet, event_dest).await {
+                                    tracing::warn!("BMCA slave: Failed to send Delay_Req: {}", e);
+                                } else {
+                                    tracing::trace!("BMCA slave: Sent Delay_Req (seq={})", delay_req_seq);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Background PTP sync task.
 pub async fn ptp_sync_loop(
     client: &mut PtpClient,
@@ -1361,6 +1677,7 @@ pub async fn run_ptp_slave(
         &clock_identity,
         &mut announce_seq,
         255,  // Worst clock class - we want HomePod to be master
+        255,  // Worst priority1 - we want HomePod to be master
     ).await {
         tracing::warn!("Failed to send initial Announce: {}", e);
     }
@@ -1392,6 +1709,7 @@ pub async fn run_ptp_slave(
                     &clock_identity,
                     &mut announce_seq,
                     255,  // Worst clock class - we want HomePod to be master
+                    255,  // Worst priority1 - we want HomePod to be master
                 ).await {
                     tracing::warn!("Failed to send periodic Announce: {}", e);
                 } else {

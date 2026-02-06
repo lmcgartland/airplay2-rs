@@ -55,6 +55,7 @@ pub mod payload_types {
     pub const SYNC: u8 = 84;
     pub const RETRANSMIT_REQUEST: u8 = 85;
     pub const RETRANSMIT_RESPONSE: u8 = 86;
+    pub const PTP_SYNC: u8 = 87;
     pub const AUDIO_REALTIME: u8 = 96;
     pub const AUDIO_BUFFERED: u8 = 103;
 }
@@ -649,6 +650,104 @@ impl RtpSender {
         }
 
         Ok(Some(packet.to_vec()))
+    }
+
+    /// Prepare a PTP-mode sync packet (PT=87, 28 bytes) without sending.
+    ///
+    /// PTP sync uses a different format than NTP sync (PT=84):
+    /// - 28 bytes instead of 20
+    /// - PTP clock time (device uptime) instead of NTP epoch
+    /// - Includes the PTP master clock ID
+    ///
+    /// Format (28 bytes):
+    /// - Byte 0: 0x90 (first sync, extension bit) or 0x80 (subsequent)
+    /// - Byte 1: 0xD7 (marker | PT=87)
+    /// - Bytes 2-3: sequence number (BE u16)
+    /// - Bytes 4-7: current RTP timestamp (BE u32)
+    /// - Bytes 8-11: PTP seconds (BE u32)
+    /// - Bytes 12-15: PTP fractional seconds (BE u32, fixed-point)
+    /// - Bytes 16-19: next RTP timestamp (BE u32)
+    /// - Bytes 20-27: master clock ID (8 bytes)
+    pub fn prepare_ptp_sync(
+        &mut self,
+        current_rtp_ts: u32,
+        ptp_clock_ns: u64,
+        next_rtp_ts: u32,
+        master_clock_id: &[u8; 8],
+    ) -> Result<Option<Vec<u8>>> {
+        let dest = self.control_dest.unwrap_or(self.dest);
+
+        if dest.port() == 0 {
+            tracing::debug!("Skipping PTP sync packet (no control port)");
+            return Ok(None);
+        }
+
+        let mut packet = [0u8; 28];
+
+        packet[0] = if !self.first_sync_sent {
+            self.first_sync_sent = true;
+            0x90
+        } else {
+            0x80
+        };
+
+        // 0xD7 = marker (0x80) | PT 87 (0x57)
+        packet[1] = 0xD7;
+
+        // Sequence
+        packet[2..4].copy_from_slice(&self.sync_sequence.to_be_bytes());
+        self.sync_sequence = self.sync_sequence.wrapping_add(1);
+
+        // Current RTP timestamp
+        packet[4..8].copy_from_slice(&current_rtp_ts.to_be_bytes());
+
+        // PTP time: seconds(32) + fraction(32)
+        let ptp_secs = (ptp_clock_ns / 1_000_000_000) as u32;
+        let ptp_nanos = ptp_clock_ns % 1_000_000_000;
+        let ptp_frac = ((ptp_nanos << 32) / 1_000_000_000) as u32;
+        packet[8..12].copy_from_slice(&ptp_secs.to_be_bytes());
+        packet[12..16].copy_from_slice(&ptp_frac.to_be_bytes());
+
+        // Next RTP timestamp
+        packet[16..20].copy_from_slice(&next_rtp_ts.to_be_bytes());
+
+        // Master clock ID
+        packet[20..28].copy_from_slice(master_clock_id);
+
+        if self.sync_sequence <= 2 {
+            tracing::info!(
+                "DIAG PTP sync #{}: dest={}, rtp_ts={}, ptp_secs={}, ptp_frac={}, clock_id={:02x?}",
+                self.sync_sequence - 1, dest, current_rtp_ts, ptp_secs, ptp_frac, master_clock_id
+            );
+        }
+
+        Ok(Some(packet.to_vec()))
+    }
+
+    /// Send a PTP-mode sync packet (PT=87, 28 bytes).
+    pub fn send_ptp_sync(
+        &mut self,
+        current_rtp_ts: u32,
+        ptp_clock_ns: u64,
+        next_rtp_ts: u32,
+        master_clock_id: &[u8; 8],
+    ) -> Result<()> {
+        let packet = match self.prepare_ptp_sync(current_rtp_ts, ptp_clock_ns, next_rtp_ts, master_clock_id)? {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        let dest = self.control_dest.unwrap_or(self.dest);
+        let socket = self.control_socket.as_ref()
+            .or(self.socket.as_ref())
+            .ok_or_else(|| Error::Streaming(
+                airplay_core::error::StreamingError::Encoding("Socket not bound".into())
+            ))?;
+
+        socket.send_to(&packet, dest)?;
+        tracing::debug!("PTP sync packet sent to {}: rtp_ts={}", dest, current_rtp_ts);
+
+        Ok(())
     }
 
     /// Clone the data socket and destination for external use (e.g. sender thread).
@@ -1315,6 +1414,164 @@ mod tests {
             sender.first_sync_sent = true;
             sender.reset_sync_state();
             assert!(!sender.first_sync_sent);
+        }
+    }
+
+    mod ptp_sync {
+        use super::*;
+
+        #[test]
+        fn ptp_sync_constant_is_87() {
+            assert_eq!(payload_types::PTP_SYNC, 87);
+        }
+
+        #[test]
+        fn ptp_sync_packet_is_28_bytes() {
+            let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let listener_addr = listener.local_addr().unwrap();
+            listener.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+
+            let mut sender = RtpSender::new(listener_addr, 0xABCD);
+            sender.set_control_dest(listener_addr);
+            sender.bind(0).unwrap();
+
+            let clock_id = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11];
+            sender.send_ptp_sync(44100, 188_748_000_000_000, 44100 + 352, &clock_id).unwrap();
+
+            let mut buf = [0u8; 64];
+            let (len, _) = listener.recv_from(&mut buf).unwrap();
+            assert_eq!(len, 28, "PTP sync packet must be 28 bytes");
+        }
+
+        #[test]
+        fn ptp_sync_has_pt_87() {
+            let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let listener_addr = listener.local_addr().unwrap();
+            listener.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+
+            let mut sender = RtpSender::new(listener_addr, 0xABCD);
+            sender.set_control_dest(listener_addr);
+            sender.bind(0).unwrap();
+
+            let clock_id = [0x01; 8];
+            sender.send_ptp_sync(0, 0, 0, &clock_id).unwrap();
+
+            let mut buf = [0u8; 64];
+            listener.recv_from(&mut buf).unwrap();
+
+            // Byte 1: 0xD7 = marker (0x80) | PT 87 (0x57)
+            assert_eq!(buf[1], 0xD7);
+            // Verify PT extraction
+            assert_eq!(buf[1] & 0x7F, payload_types::PTP_SYNC);
+        }
+
+        #[test]
+        fn ptp_sync_first_has_extension_bit() {
+            let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let listener_addr = listener.local_addr().unwrap();
+            listener.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+
+            let mut sender = RtpSender::new(listener_addr, 0xABCD);
+            sender.set_control_dest(listener_addr);
+            sender.bind(0).unwrap();
+
+            let clock_id = [0x01; 8];
+
+            // First PTP sync: extension bit set
+            sender.send_ptp_sync(0, 0, 0, &clock_id).unwrap();
+            let mut buf = [0u8; 64];
+            listener.recv_from(&mut buf).unwrap();
+            assert_eq!(buf[0], 0x90, "first PTP sync should have extension bit");
+
+            // Second PTP sync: no extension bit
+            sender.send_ptp_sync(352, 1000000000, 704, &clock_id).unwrap();
+            listener.recv_from(&mut buf).unwrap();
+            assert_eq!(buf[0], 0x80, "subsequent PTP syncs should NOT have extension bit");
+        }
+
+        #[test]
+        fn ptp_sync_timestamp_encoding() {
+            let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let listener_addr = listener.local_addr().unwrap();
+            listener.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+
+            let mut sender = RtpSender::new(listener_addr, 0xABCD);
+            sender.set_control_dest(listener_addr);
+            sender.bind(0).unwrap();
+
+            let clock_id = [0x01; 8];
+            // 188748.5 seconds = 188748500000000 ns
+            let ptp_ns: u64 = 188_748_500_000_000;
+            sender.send_ptp_sync(44100, ptp_ns, 44452, &clock_id).unwrap();
+
+            let mut buf = [0u8; 64];
+            listener.recv_from(&mut buf).unwrap();
+
+            // Bytes 8-11: PTP seconds
+            let secs = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+            assert_eq!(secs, 188748, "PTP seconds should be device uptime");
+
+            // Bytes 12-15: PTP fraction (0.5s = 0x80000000)
+            let frac = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+            assert_eq!(frac, 0x80000000, "PTP fraction for 0.5s should be 0x80000000");
+        }
+
+        #[test]
+        fn ptp_sync_clock_id_placement() {
+            let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let listener_addr = listener.local_addr().unwrap();
+            listener.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+
+            let mut sender = RtpSender::new(listener_addr, 0xABCD);
+            sender.set_control_dest(listener_addr);
+            sender.bind(0).unwrap();
+
+            let clock_id: [u8; 8] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11];
+            sender.send_ptp_sync(0, 0, 0, &clock_id).unwrap();
+
+            let mut buf = [0u8; 64];
+            listener.recv_from(&mut buf).unwrap();
+
+            // Bytes 20-27: master clock ID
+            assert_eq!(&buf[20..28], &clock_id, "master clock ID must be in bytes 20-27");
+        }
+
+        #[test]
+        fn ptp_sync_rtp_timestamps() {
+            let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let listener_addr = listener.local_addr().unwrap();
+            listener.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+
+            let mut sender = RtpSender::new(listener_addr, 0xABCD);
+            sender.set_control_dest(listener_addr);
+            sender.bind(0).unwrap();
+
+            let clock_id = [0x01; 8];
+            let current_rtp: u32 = 44100;
+            let next_rtp: u32 = 44452;
+            sender.send_ptp_sync(current_rtp, 0, next_rtp, &clock_id).unwrap();
+
+            let mut buf = [0u8; 64];
+            listener.recv_from(&mut buf).unwrap();
+
+            // Bytes 4-7: current RTP timestamp
+            let got_current = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            assert_eq!(got_current, current_rtp);
+
+            // Bytes 16-19: next RTP timestamp
+            let got_next = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
+            assert_eq!(got_next, next_rtp);
+        }
+
+        #[test]
+        fn prepare_ptp_sync_returns_none_for_port_zero() {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let mut sender = RtpSender::new(addr, 0xABCD);
+            // control_dest port is 0
+
+            let clock_id = [0x01; 8];
+            let result = sender.prepare_ptp_sync(0, 0, 0, &clock_id).unwrap();
+            assert!(result.is_none());
         }
     }
 }
