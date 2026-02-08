@@ -17,6 +17,9 @@ pub enum View {
     Player,
     /// Multi-room group management.
     Group,
+    /// USB audio input source.
+    #[cfg(feature = "usb-audio")]
+    UsbAudio,
     /// Bluetooth audio source (Linux only).
     #[cfg(feature = "bluetooth")]
     Bluetooth,
@@ -25,32 +28,16 @@ pub enum View {
 impl View {
     /// Get the next view in the cycle.
     pub fn next(self) -> Self {
-        match self {
-            View::Devices => View::Browser,
-            View::Browser => View::Player,
-            View::Player => View::Group,
-            #[cfg(feature = "bluetooth")]
-            View::Group => View::Bluetooth,
-            #[cfg(feature = "bluetooth")]
-            View::Bluetooth => View::Devices,
-            #[cfg(not(feature = "bluetooth"))]
-            View::Group => View::Devices,
-        }
+        let views = Self::all();
+        let idx = views.iter().position(|v| *v == self).unwrap_or(0);
+        views[(idx + 1) % views.len()]
     }
 
     /// Get the previous view in the cycle.
     pub fn prev(self) -> Self {
-        match self {
-            #[cfg(feature = "bluetooth")]
-            View::Devices => View::Bluetooth,
-            #[cfg(not(feature = "bluetooth"))]
-            View::Devices => View::Group,
-            View::Browser => View::Devices,
-            View::Player => View::Browser,
-            View::Group => View::Player,
-            #[cfg(feature = "bluetooth")]
-            View::Bluetooth => View::Group,
-        }
+        let views = Self::all();
+        let idx = views.iter().position(|v| *v == self).unwrap_or(0);
+        views[(idx + views.len() - 1) % views.len()]
     }
 
     /// Get display name for the view.
@@ -60,6 +47,8 @@ impl View {
             View::Browser => "Browser",
             View::Player => "Player",
             View::Group => "Group",
+            #[cfg(feature = "usb-audio")]
+            View::UsbAudio => "USB Audio",
             #[cfg(feature = "bluetooth")]
             View::Bluetooth => "Bluetooth",
         }
@@ -67,26 +56,17 @@ impl View {
 
     /// Get all views in order.
     pub fn all() -> Vec<View> {
+        let mut views = vec![View::Devices, View::Browser, View::Player, View::Group];
+        #[cfg(feature = "usb-audio")]
+        views.push(View::UsbAudio);
         #[cfg(feature = "bluetooth")]
-        {
-            vec![View::Devices, View::Browser, View::Player, View::Group, View::Bluetooth]
-        }
-        #[cfg(not(feature = "bluetooth"))]
-        {
-            vec![View::Devices, View::Browser, View::Player, View::Group]
-        }
+        views.push(View::Bluetooth);
+        views
     }
 
     /// Get the index of this view in the tab bar.
     pub fn index(&self) -> usize {
-        match self {
-            View::Devices => 0,
-            View::Browser => 1,
-            View::Player => 2,
-            View::Group => 3,
-            #[cfg(feature = "bluetooth")]
-            View::Bluetooth => 4,
-        }
+        Self::all().iter().position(|v| v == self).unwrap_or(0)
     }
 }
 
@@ -172,6 +152,10 @@ pub struct AppState {
     // Equalizer state
     /// Audio equalizer state.
     pub eq: EqState,
+
+    // USB audio state
+    #[cfg(feature = "usb-audio")]
+    pub usb_audio: UsbAudioState,
 
     // Bluetooth state (Linux only)
     #[cfg(feature = "bluetooth")]
@@ -326,6 +310,74 @@ pub struct GroupMemberState {
     pub is_leader: bool,
 }
 
+/// USB audio input device entry for UI.
+#[cfg(feature = "usb-audio")]
+#[derive(Debug, Clone)]
+pub struct UsbAudioDeviceEntry {
+    /// Device name.
+    pub name: String,
+    /// Device index in cpal's enumeration.
+    pub device_index: usize,
+    /// Sample rate in Hz.
+    pub sample_rate: u32,
+    /// Number of input channels.
+    pub channels: u16,
+}
+
+/// USB audio input state for UI.
+#[cfg(feature = "usb-audio")]
+#[derive(Debug, Clone)]
+pub struct UsbAudioState {
+    /// Available input devices.
+    pub devices: Vec<UsbAudioDeviceEntry>,
+    /// Selected device index in list.
+    pub device_index: usize,
+    /// Currently selected device for capture.
+    pub selected_device: Option<UsbAudioDeviceEntry>,
+    /// Whether streaming audio from USB input.
+    pub streaming: bool,
+    /// Current audio level (RMS, 0.0-1.0).
+    pub audio_level: f32,
+    /// Total samples received.
+    pub samples_received: u64,
+}
+
+#[cfg(feature = "usb-audio")]
+impl Default for UsbAudioState {
+    fn default() -> Self {
+        Self {
+            devices: Vec::new(),
+            device_index: 0,
+            selected_device: None,
+            streaming: false,
+            audio_level: 0.0,
+            samples_received: 0,
+        }
+    }
+}
+
+#[cfg(feature = "usb-audio")]
+impl UsbAudioState {
+    /// Get selected device (if any) from the list.
+    pub fn highlighted_device(&self) -> Option<&UsbAudioDeviceEntry> {
+        self.devices.get(self.device_index)
+    }
+
+    /// Move selection up.
+    pub fn select_prev(&mut self) {
+        if !self.devices.is_empty() && self.device_index > 0 {
+            self.device_index -= 1;
+        }
+    }
+
+    /// Move selection down.
+    pub fn select_next(&mut self) {
+        if !self.devices.is_empty() && self.device_index < self.devices.len() - 1 {
+            self.device_index += 1;
+        }
+    }
+}
+
 /// Bluetooth state for UI.
 #[cfg(feature = "bluetooth")]
 #[derive(Debug, Clone)]
@@ -439,6 +491,8 @@ impl Default for AppState {
             group: None,
             group_member_index: 0,
             eq: EqState::default(),
+            #[cfg(feature = "usb-audio")]
+            usb_audio: UsbAudioState::default(),
             #[cfg(feature = "bluetooth")]
             bluetooth: BluetoothState::default(),
         }
@@ -486,6 +540,10 @@ impl AppState {
                     }
                 }
             }
+            #[cfg(feature = "usb-audio")]
+            View::UsbAudio => {
+                self.usb_audio.select_prev();
+            }
             #[cfg(feature = "bluetooth")]
             View::Bluetooth => {
                 self.bluetooth.select_prev();
@@ -509,6 +567,10 @@ impl AppState {
                         self.group_member_index += 1;
                     }
                 }
+            }
+            #[cfg(feature = "usb-audio")]
+            View::UsbAudio => {
+                self.usb_audio.select_next();
             }
             #[cfg(feature = "bluetooth")]
             View::Bluetooth => {

@@ -5,6 +5,8 @@ mod browser;
 mod player;
 mod group;
 mod help;
+#[cfg(feature = "usb-audio")]
+mod usb_audio;
 #[cfg(feature = "bluetooth")]
 mod bluetooth;
 
@@ -13,6 +15,8 @@ pub use browser::render_browser;
 pub use player::render_player;
 pub use group::render_group;
 pub use help::render_help;
+#[cfg(feature = "usb-audio")]
+pub use usb_audio::render_usb_audio;
 #[cfg(feature = "bluetooth")]
 pub use bluetooth::render_bluetooth;
 
@@ -50,6 +54,8 @@ pub fn render(frame: &mut Frame, state: &AppState, browser: &FileBrowser) {
         View::Browser => render_browser(frame, chunks[1], browser),
         View::Player => render_player(frame, chunks[1], state),
         View::Group => render_group(frame, chunks[1], state),
+        #[cfg(feature = "usb-audio")]
+        View::UsbAudio => render_usb_audio(frame, chunks[1], state),
         #[cfg(feature = "bluetooth")]
         View::Bluetooth => render_bluetooth(frame, chunks[1], state),
     }
@@ -107,6 +113,8 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
             View::Browser => "Enter: Select  Esc: Back  Tab: Next view  ?: Help",
             View::Player => "Space: Play/Pause  s: Stop  +/-: Volume  Tab: Next view",
             View::Group => "a: Add  d: Remove  Enter: Select  Tab: Next view",
+            #[cfg(feature = "usb-audio")]
+            View::UsbAudio => "r: Refresh  Enter: Select  u: Start streaming  x: Stop",
             #[cfg(feature = "bluetooth")]
             View::Bluetooth => "s: Scan  p: Pair  c: Connect  d: Disconnect  u: Use as source",
         };

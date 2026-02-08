@@ -3,7 +3,7 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-#[cfg(all(feature = "bluetooth", target_os = "linux"))]
+#[cfg(any(all(feature = "bluetooth", target_os = "linux"), feature = "usb-audio"))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn, error, instrument};
 
 use airplay_client::{AirPlayClient, PlaybackState, ClientEvent, CallbackHandler, EqConfig};
-#[cfg(all(feature = "bluetooth", target_os = "linux"))]
+#[cfg(any(all(feature = "bluetooth", target_os = "linux"), feature = "usb-audio"))]
 use airplay_client::{LiveFrameSender, LivePcmFrame};
 use airplay_core::{Device, StreamConfig};
 
@@ -35,6 +35,17 @@ use airplay_bluetooth::{
 /// Shared state for the Bluetooth capture forwarding thread.
 #[cfg(all(feature = "bluetooth", target_os = "linux"))]
 struct BtCaptureShared {
+    /// Flag to stop the capture thread.
+    stop: AtomicBool,
+    /// Current audio level (RMS) for UI display.
+    audio_level: std::sync::atomic::AtomicU32,
+    /// Total samples captured for UI display.
+    samples_received: AtomicU64,
+}
+
+/// Shared state for the USB audio capture forwarding thread.
+#[cfg(feature = "usb-audio")]
+struct UsbCaptureShared {
     /// Flag to stop the capture thread.
     stop: AtomicBool,
     /// Current audio level (RMS) for UI display.
@@ -109,6 +120,15 @@ pub struct App {
     /// Bluetooth capture thread handle.
     #[cfg(all(feature = "bluetooth", target_os = "linux"))]
     bt_capture_thread: Option<std::thread::JoinHandle<()>>,
+    /// USB audio capture shared state.
+    #[cfg(feature = "usb-audio")]
+    usb_capture_shared: Option<Arc<UsbCaptureShared>>,
+    /// USB audio capture thread handle.
+    #[cfg(feature = "usb-audio")]
+    usb_capture_thread: Option<std::thread::JoinHandle<()>>,
+    /// USB audio cpal stream (must stay on main thread).
+    #[cfg(feature = "usb-audio")]
+    usb_capture_stream: Option<crate::usb_audio::CaptureStream>,
 }
 
 impl App {
@@ -172,6 +192,12 @@ impl App {
             bt_capture_shared: None,
             #[cfg(all(feature = "bluetooth", target_os = "linux"))]
             bt_capture_thread: None,
+            #[cfg(feature = "usb-audio")]
+            usb_capture_shared: None,
+            #[cfg(feature = "usb-audio")]
+            usb_capture_thread: None,
+            #[cfg(feature = "usb-audio")]
+            usb_capture_stream: None,
         })
     }
 
@@ -301,6 +327,13 @@ impl App {
                 KeyCode::Char('-') => Some(Action::VolumeDown),
                 _ => None,
             },
+            #[cfg(feature = "usb-audio")]
+            View::UsbAudio => match key.code {
+                KeyCode::Char('r') => Some(Action::UsbAudioRefreshDevices),
+                KeyCode::Char('u') => Some(Action::UsbAudioStartSource),
+                KeyCode::Char('x') => Some(Action::UsbAudioStopSource),
+                _ => None,
+            },
             #[cfg(feature = "bluetooth")]
             View::Bluetooth => match key.code {
                 KeyCode::Char('s') => Some(Action::BluetoothScan),
@@ -332,6 +365,12 @@ impl App {
             Action::NextView => {
                 self.state.view = self.state.view.next();
                 debug!("Switched to view: {:?}", self.state.view);
+
+                // Auto-enumerate USB audio devices when first entering view
+                #[cfg(feature = "usb-audio")]
+                if self.state.view == View::UsbAudio && self.state.usb_audio.devices.is_empty() {
+                    self.dispatch(Action::UsbAudioRefreshDevices);
+                }
 
                 // Check Bluetooth setup when first entering Bluetooth view
                 #[cfg(feature = "bluetooth")]
@@ -630,6 +669,27 @@ impl App {
                     }
                 }
 
+                // Update USB audio UI from capture thread's shared state
+                #[cfg(feature = "usb-audio")]
+                if self.state.usb_audio.streaming {
+                    if let Some(ref shared) = self.usb_capture_shared {
+                        let level_scaled = shared.audio_level.load(Ordering::Relaxed);
+                        self.state.usb_audio.audio_level = level_scaled as f32 / 1000.0;
+                        self.state.usb_audio.samples_received = shared.samples_received.load(Ordering::Relaxed);
+
+                        if shared.stop.load(Ordering::Relaxed) {
+                            if self.usb_capture_thread.as_ref().map_or(true, |h| h.is_finished()) {
+                                warn!("USB audio capture thread stopped");
+                                self.usb_capture_shared = None;
+                                self.usb_capture_thread = None;
+                                self.usb_capture_stream = None;
+                                self.state.usb_audio.streaming = false;
+                                self.state.set_status(StatusMessage::error("USB audio capture stopped"));
+                            }
+                        }
+                    }
+                }
+
                 // Update Bluetooth UI from capture thread's shared state (Linux only)
                 #[cfg(all(feature = "bluetooth", target_os = "linux"))]
                 if self.state.bluetooth.is_source_active {
@@ -653,6 +713,239 @@ impl App {
                         }
                     }
                 }
+            }
+
+            // USB Audio actions
+            #[cfg(feature = "usb-audio")]
+            Action::UsbAudioRefreshDevices => {
+                debug!("Refreshing USB audio devices");
+                let devices = crate::usb_audio::list_input_devices();
+                let entries: Vec<crate::state::UsbAudioDeviceEntry> = devices
+                    .into_iter()
+                    .map(|d| crate::state::UsbAudioDeviceEntry {
+                        name: d.name,
+                        device_index: d.index,
+                        sample_rate: d.sample_rate,
+                        channels: d.channels,
+                    })
+                    .collect();
+                info!("Found {} USB audio input devices", entries.len());
+                self.dispatch(Action::UsbAudioDevicesListed(entries));
+            }
+
+            #[cfg(feature = "usb-audio")]
+            Action::UsbAudioDevicesListed(devices) => {
+                self.state.usb_audio.devices = devices;
+                if self.state.usb_audio.device_index >= self.state.usb_audio.devices.len() {
+                    self.state.usb_audio.device_index = 0;
+                }
+            }
+
+            #[cfg(feature = "usb-audio")]
+            Action::UsbAudioSelectDevice => {
+                if let Some(device) = self.state.usb_audio.highlighted_device().cloned() {
+                    info!("Selected USB audio device: {}", device.name);
+                    self.state.usb_audio.selected_device = Some(device.clone());
+                    self.state.set_status(StatusMessage::info(format!(
+                        "Selected: {}",
+                        device.name
+                    )));
+                }
+            }
+
+            #[cfg(feature = "usb-audio")]
+            Action::UsbAudioStartSource => {
+                if let Some(ref device) = self.state.usb_audio.selected_device.clone() {
+                    let client_connected = {
+                        let client = self.client.lock().await;
+                        client.is_connected()
+                    };
+
+                    if !client_connected {
+                        self.state.set_status(StatusMessage::error("Connect to an AirPlay device first"));
+                        return;
+                    }
+
+                    info!("Starting USB audio source from {}", device.name);
+
+                    // Stop any existing capture thread
+                    if let Some(ref shared) = self.usb_capture_shared {
+                        shared.stop.store(true, Ordering::Relaxed);
+                    }
+                    self.usb_capture_stream = None; // drop stream first to unblock thread
+                    if let Some(handle) = self.usb_capture_thread.take() {
+                        // Brief blocking join is OK here since thread should exit quickly
+                        let _ = handle.join();
+                    }
+                    self.usb_capture_shared = None;
+
+                    let device_index = device.device_index;
+                    let sample_rate = device.sample_rate;
+                    let channels = device.channels;
+
+                    match crate::usb_audio::start_usb_capture(device_index, sample_rate, channels) {
+                        Ok((capture_rx, capture_stream)) => {
+                            info!("USB audio capture started");
+
+                            // Capture callback always outputs stereo (extracts first 2 channels)
+                            use airplay_client::LiveAudioDecoder;
+                            let (sender, decoder) = LiveAudioDecoder::create_pair(sample_rate, 2, 64);
+
+                            let shared = Arc::new(UsbCaptureShared {
+                                stop: AtomicBool::new(false),
+                                audio_level: std::sync::atomic::AtomicU32::new(0),
+                                samples_received: AtomicU64::new(0),
+                            });
+                            let shared_clone = Arc::clone(&shared);
+
+                            let thread = std::thread::Builder::new()
+                                .name("usb-capture".into())
+                                .spawn(move || {
+                                    use crate::usb_audio::{CaptureError, calculate_rms};
+
+                                    info!("USB capture thread started");
+                                    let mut total_frames_sent = 0u64;
+
+                                    while !shared_clone.stop.load(Ordering::Relaxed) {
+                                        let result = capture_rx.recv_timeout(Duration::from_millis(50));
+                                        match result {
+                                            Ok(frame) => {
+                                                let rms = calculate_rms(&frame.samples);
+                                                shared_clone.audio_level.store(
+                                                    (rms * 1000.0) as u32,
+                                                    Ordering::Relaxed,
+                                                );
+
+                                                let num_samples = frame.samples.len() / 2;
+                                                shared_clone.samples_received.fetch_add(
+                                                    num_samples as u64,
+                                                    Ordering::Relaxed,
+                                                );
+
+                                                let live_frame = LivePcmFrame {
+                                                    samples: frame.samples,
+                                                    channels: 2,
+                                                    sample_rate,
+                                                };
+
+                                                if sender.try_send(live_frame) {
+                                                    total_frames_sent += 1;
+                                                    if total_frames_sent % 100 == 0 {
+                                                        debug!("USB: sent {} frames to AirPlay", total_frames_sent);
+                                                    }
+                                                } else if sender.is_full() {
+                                                    debug!("USB: live sender channel full, dropping frame");
+                                                }
+                                            }
+                                            Err(CaptureError::Timeout) => {
+                                                // No data available, continue
+                                            }
+                                            Err(e) => {
+                                                error!("USB capture error: {}", e);
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    info!("USB capture thread stopping, sent {} frames", total_frames_sent);
+                                    drop(capture_rx);
+                                })
+                                .expect("Failed to spawn USB capture thread");
+
+                            // Pre-fill buffer
+                            info!("Waiting for USB capture buffer to pre-fill...");
+                            std::thread::sleep(Duration::from_millis(500));
+                            info!("Pre-fill complete, starting AirPlay streaming");
+
+                            let stream_result = {
+                                let mut client = self.client.lock().await;
+                                client.set_render_delay_ms(500);
+                                let eq_config = self.state.eq.config.clone();
+                                let eq_params = Arc::clone(&self.state.eq.params);
+                                if let Err(e) = client.set_eq_params(eq_config, eq_params) {
+                                    warn!("Failed to set EQ params for USB streaming: {}", e);
+                                }
+                                client.start_live_streaming_with_decoder(decoder).await
+                            };
+
+                            match stream_result {
+                                Ok(()) => {
+                                    info!("USB → AirPlay streaming started");
+                                    self.usb_capture_shared = Some(shared);
+                                    self.usb_capture_thread = Some(thread);
+                                    self.usb_capture_stream = Some(capture_stream);
+                                    self.state.usb_audio.streaming = true;
+                                    self.state.usb_audio.samples_received = 0;
+                                    self.state.set_status(StatusMessage::info(format!(
+                                        "Streaming {} → AirPlay",
+                                        device.name
+                                    )));
+                                }
+                                Err(e) => {
+                                    error!("Failed to start USB live streaming: {}", e);
+                                    shared.stop.store(true, Ordering::Relaxed);
+                                    let _ = thread.join();
+                                    drop(capture_stream);
+                                    self.state.set_status(StatusMessage::error(format!(
+                                        "Failed to start streaming: {}",
+                                        e
+                                    )));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to start USB capture: {}", e);
+                            self.state.set_status(StatusMessage::error(format!(
+                                "Failed to start capture: {}",
+                                e
+                            )));
+                        }
+                    }
+                } else {
+                    self.state.set_status(StatusMessage::error("Select a USB audio device first"));
+                }
+            }
+
+            #[cfg(feature = "usb-audio")]
+            Action::UsbAudioStopSource => {
+                info!("Stopping USB audio source");
+
+                // Signal stop first
+                if let Some(ref shared) = self.usb_capture_shared {
+                    shared.stop.store(true, Ordering::Relaxed);
+                }
+                // Drop the cpal stream — this disconnects the channel and
+                // unblocks the capture thread's recv_timeout
+                self.usb_capture_stream = None;
+                // Join the thread on a blocking task to avoid stalling the event loop
+                if let Some(handle) = self.usb_capture_thread.take() {
+                    tokio::task::spawn_blocking(move || {
+                        let _ = handle.join();
+                    });
+                }
+                self.usb_capture_shared = None;
+
+                {
+                    let mut client = self.client.lock().await;
+                    if let Err(e) = client.stop().await {
+                        warn!("Failed to stop AirPlay playback: {}", e);
+                    }
+                }
+
+                self.state.usb_audio.streaming = false;
+                self.state.set_status(StatusMessage::info("USB audio source stopped"));
+            }
+
+            #[cfg(feature = "usb-audio")]
+            Action::UsbAudioLevel { level, samples } => {
+                self.state.usb_audio.audio_level = level;
+                self.state.usb_audio.samples_received = samples;
+            }
+
+            #[cfg(feature = "usb-audio")]
+            Action::UsbAudioError(e) => {
+                error!("USB audio error: {}", e);
+                self.state.set_status(StatusMessage::error(e));
             }
 
             // Bluetooth actions (Linux only)
@@ -1112,6 +1405,11 @@ impl App {
                     entry.is_selected = !entry.is_selected;
                     debug!("Toggled device selection: {} = {}", entry.device.name, entry.is_selected);
                 }
+            }
+            #[cfg(feature = "usb-audio")]
+            View::UsbAudio => {
+                // Select the highlighted USB audio device
+                self.dispatch(Action::UsbAudioSelectDevice);
             }
             #[cfg(feature = "bluetooth")]
             View::Bluetooth => {

@@ -248,11 +248,11 @@ fn capture_thread(
             BluetoothError::Alsa(format!("Failed to set access: {}", e))
         })?;
 
-        hwp.set_buffer_size(BUFFER_FRAMES as i64).map_err(|e| {
+        hwp.set_buffer_size(BUFFER_FRAMES as alsa::pcm::Frames).map_err(|e| {
             BluetoothError::Alsa(format!("Failed to set buffer size: {}", e))
         })?;
 
-        hwp.set_period_size(FRAMES_PER_PERIOD as i64, ValueOr::Nearest)
+        hwp.set_period_size(FRAMES_PER_PERIOD as alsa::pcm::Frames, ValueOr::Nearest)
             .map_err(|e| BluetoothError::Alsa(format!("Failed to set period size: {}", e)))?;
 
         pcm.hw_params(&hwp).map_err(|e| {

@@ -159,4 +159,27 @@ pub enum Action {
     #[cfg(feature = "bluetooth")]
     /// Bluetooth error occurred.
     BluetoothError(String),
+
+    // USB Audio actions
+    #[cfg(feature = "usb-audio")]
+    /// Refresh USB audio input device list.
+    UsbAudioRefreshDevices,
+    #[cfg(feature = "usb-audio")]
+    /// USB audio devices enumerated.
+    UsbAudioDevicesListed(Vec<crate::state::UsbAudioDeviceEntry>),
+    #[cfg(feature = "usb-audio")]
+    /// Select the highlighted USB audio device.
+    UsbAudioSelectDevice,
+    #[cfg(feature = "usb-audio")]
+    /// Start USB audio capture and AirPlay streaming.
+    UsbAudioStartSource,
+    #[cfg(feature = "usb-audio")]
+    /// Stop USB audio capture.
+    UsbAudioStopSource,
+    #[cfg(feature = "usb-audio")]
+    /// Update audio level meter from capture thread.
+    UsbAudioLevel { level: f32, samples: u64 },
+    #[cfg(feature = "usb-audio")]
+    /// USB audio error.
+    UsbAudioError(String),
 }
