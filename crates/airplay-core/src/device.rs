@@ -27,17 +27,61 @@ pub struct DeviceInfo {
 /// A discovered AirPlay receiver with full metadata.
 #[derive(Debug, Clone)]
 pub struct Device {
+    // --- Core identity ---
     pub id: DeviceId,
     pub name: String,
     pub model: String,
+    pub manufacturer: Option<String>,
+    pub serial_number: Option<String>,
     pub addresses: Vec<IpAddr>,
     pub port: u16,
+
+    // --- Capabilities ---
     pub features: Features,
+    /// Required sender features from `rsf` TXT field.
+    pub required_sender_features: Option<Features>,
     pub public_key: Option<[u8; 32]>,
     pub source_version: Version,
+    pub firmware_version: Option<String>,
+    pub os_version: Option<String>,
+    pub protocol_version: Option<String>,
     pub requires_password: bool,
+
+    // --- Status & access ---
+    /// System/status flags from `flags` (AirPlay) or `sf` (RAOP) TXT field.
+    pub status_flags: u64,
+    /// Access control level from `acl` TXT field (0=everyone, 1=same network, 2=home members).
+    pub access_control: Option<u8>,
+
+    // --- Pairing identities ---
+    /// Public CU AirPlay pairing identity from `pi` TXT field.
+    pub pairing_identity: Option<String>,
+    /// Public CU System Pairing Identity from `psi` TXT field.
+    pub system_pairing_identity: Option<String>,
+    /// Bluetooth address from `btaddr` TXT field.
+    pub bluetooth_address: Option<String>,
+    /// HomeKit home UUID from `hkid` TXT field.
+    pub homekit_home_id: Option<String>,
+
+    // --- Group / multi-room ---
     pub group_id: Option<uuid::Uuid>,
     pub is_group_leader: bool,
+    /// Group public name from `gpn` TXT field.
+    pub group_public_name: Option<String>,
+    /// Group contains discoverable leader from `gcgl` TXT field.
+    pub group_contains_discoverable_leader: bool,
+    /// Home group UUID from `hgid` TXT field.
+    pub home_group_id: Option<String>,
+    /// Household ID from `hmid` TXT field.
+    pub household_id: Option<String>,
+    /// Parent group UUID from `pgid` TXT field.
+    pub parent_group_id: Option<uuid::Uuid>,
+    /// Parent group contains discoverable leader from `pgcgl` TXT field.
+    pub parent_group_contains_discoverable_leader: bool,
+    /// Tight sync UUID from `tsid` TXT field.
+    pub tight_sync_id: Option<uuid::Uuid>,
+
+    // --- RAOP (legacy AirPlay 1) ---
     /// RAOP service port (from `_raop._tcp` SRV record).
     pub raop_port: Option<u16>,
     /// RAOP encryption types from `et` TXT field (0=none, 1=RSA, 3=FairPlay, 4=MFiSAP, 5=FairPlay SAPv2.5).
@@ -46,6 +90,12 @@ pub struct Device {
     pub raop_codecs: Option<Vec<u8>>,
     /// RAOP transport from `tp` TXT field (e.g. "UDP", "TCP", "TCP,UDP").
     pub raop_transport: Option<String>,
+    /// RAOP metadata types from `md` TXT field.
+    pub raop_metadata_types: Option<Vec<u8>>,
+    /// RAOP digest auth from `da` TXT field.
+    pub raop_digest_auth: bool,
+    /// Vodka version from `vv` TXT field.
+    pub vodka_version: Option<String>,
 }
 
 impl DeviceId {
@@ -372,18 +422,40 @@ mod tests {
                 id: DeviceId([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]),
                 name: "Test Device".to_string(),
                 model: "AppleTV5,3".to_string(),
+                manufacturer: None,
+                serial_number: None,
                 addresses,
                 port: 7000,
                 features,
+                required_sender_features: None,
                 public_key: None,
                 source_version: version,
+                firmware_version: None,
+                os_version: None,
+                protocol_version: None,
                 requires_password: false,
+                status_flags: 0,
+                access_control: None,
+                pairing_identity: None,
+                system_pairing_identity: None,
+                bluetooth_address: None,
+                homekit_home_id: None,
                 group_id: None,
                 is_group_leader: false,
+                group_public_name: None,
+                group_contains_discoverable_leader: false,
+                home_group_id: None,
+                household_id: None,
+                parent_group_id: None,
+                parent_group_contains_discoverable_leader: false,
+                tight_sync_id: None,
                 raop_port: None,
                 raop_encryption_types: None,
                 raop_codecs: None,
                 raop_transport: None,
+                raop_metadata_types: None,
+                raop_digest_auth: false,
+                vodka_version: None,
             }
         }
 

@@ -51,6 +51,49 @@ impl TxtRecordParser {
             .map(|pw| pw == "true" || pw == "1")
             .unwrap_or(false);
 
+        // Parse required sender features
+        let required_sender_features = txt
+            .get("rsf")
+            .map(|f| Features::from_txt_value(f))
+            .transpose()?;
+
+        // Parse status/system flags
+        let status_flags = txt
+            .get("flags")
+            .or_else(|| txt.get("sf"))
+            .map(|f| Self::parse_hex_or_decimal(f))
+            .unwrap_or(0);
+
+        // Parse access control level
+        let access_control = txt
+            .get("acl")
+            .and_then(|v| v.parse::<u8>().ok());
+
+        // Parse firmware version
+        let firmware_version = txt.get("fv").cloned();
+
+        // Parse OS version
+        let os_version = txt.get("osvers").cloned();
+
+        // Parse protocol version
+        let protocol_version = txt.get("protovers").cloned();
+
+        // Parse manufacturer
+        let manufacturer = txt.get("manufacturer").cloned();
+
+        // Parse serial number
+        let serial_number = txt.get("serialNumber").cloned();
+
+        // Parse Bluetooth address
+        let bluetooth_address = txt.get("btaddr").cloned();
+
+        // Parse pairing identities
+        let pairing_identity = txt.get("pi").cloned();
+        let system_pairing_identity = txt.get("psi").cloned();
+
+        // Parse HomeKit home UUID
+        let homekit_home_id = txt.get("hkid").cloned();
+
         // Parse group UUID
         let group_id = txt
             .get("gid")
@@ -66,22 +109,83 @@ impl TxtRecordParser {
             .map(|igl| igl == "1" || igl == "true")
             .unwrap_or(false);
 
+        // Parse group public name
+        let group_public_name = txt.get("gpn").cloned();
+
+        // Parse group contains discoverable leader
+        let group_contains_discoverable_leader = txt
+            .get("gcgl")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+
+        // Parse home group ID
+        let home_group_id = txt.get("hgid").cloned();
+
+        // Parse household ID
+        let household_id = txt.get("hmid").cloned();
+
+        // Parse parent group UUID
+        let parent_group_id = txt
+            .get("pgid")
+            .map(|pgid| {
+                uuid::Uuid::parse_str(pgid)
+                    .map_err(|_| ParseError::InvalidValue(format!("invalid UUID: {}", pgid)))
+            })
+            .transpose()?;
+
+        // Parse parent group contains discoverable leader
+        let parent_group_contains_discoverable_leader = txt
+            .get("pgcgl")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+
+        // Parse tight sync UUID
+        let tight_sync_id = txt
+            .get("tsid")
+            .map(|tsid| {
+                uuid::Uuid::parse_str(tsid)
+                    .map_err(|_| ParseError::InvalidValue(format!("invalid UUID: {}", tsid)))
+            })
+            .transpose()?;
+
         Ok(Device {
             id,
             name: name.to_string(),
             model,
+            manufacturer,
+            serial_number,
             addresses,
             port,
             features,
+            required_sender_features,
             public_key,
             source_version,
+            firmware_version,
+            os_version,
+            protocol_version,
             requires_password,
+            status_flags,
+            access_control,
+            pairing_identity,
+            system_pairing_identity,
+            bluetooth_address,
+            homekit_home_id,
             group_id,
             is_group_leader,
+            group_public_name,
+            group_contains_discoverable_leader,
+            home_group_id,
+            household_id,
+            parent_group_id,
+            parent_group_contains_discoverable_leader,
+            tight_sync_id,
             raop_port: None,
             raop_encryption_types: None,
             raop_codecs: None,
             raop_transport: None,
+            raop_metadata_types: None,
+            raop_digest_auth: false,
+            vodka_version: None,
         })
     }
 
@@ -143,6 +247,27 @@ impl TxtRecordParser {
             .map(|pk| Self::parse_public_key(pk))
             .transpose()?;
 
+        // Parse firmware version
+        let firmware_version = txt.get("fv").cloned();
+
+        // Parse OS version (RAOP uses 'ov')
+        let os_version = txt.get("ov").cloned();
+
+        // Parse status flags from 'sf'
+        let status_flags = txt
+            .get("sf")
+            .map(|f| Self::parse_hex_or_decimal(f))
+            .unwrap_or(0);
+
+        // Parse vodka version
+        let vodka_version = txt.get("vv").cloned();
+
+        // Parse digest auth
+        let raop_digest_auth = txt
+            .get("da")
+            .map(|da| da == "true" || da == "1")
+            .unwrap_or(false);
+
         // Parse RAOP-specific TXT fields
         let raop_encryption_types = txt.get("et").map(|et| {
             et.split(',')
@@ -158,22 +283,50 @@ impl TxtRecordParser {
 
         let raop_transport = txt.get("tp").cloned();
 
+        let raop_metadata_types = txt.get("md").map(|md| {
+            md.split(',')
+                .filter_map(|s| s.trim().parse::<u8>().ok())
+                .collect()
+        });
+
         Ok(Device {
             id,
             name: device_name.to_string(),
             model,
+            manufacturer: None,
+            serial_number: None,
             addresses,
             port,
             features,
+            required_sender_features: None,
             public_key,
             source_version,
+            firmware_version,
+            os_version,
+            protocol_version: None,
             requires_password,
+            status_flags,
+            access_control: None,
+            pairing_identity: None,
+            system_pairing_identity: None,
+            bluetooth_address: None,
+            homekit_home_id: None,
             group_id: None,
             is_group_leader: false,
+            group_public_name: None,
+            group_contains_discoverable_leader: false,
+            home_group_id: None,
+            household_id: None,
+            parent_group_id: None,
+            parent_group_contains_discoverable_leader: false,
+            tight_sync_id: None,
             raop_port: Some(port),
             raop_encryption_types,
             raop_codecs,
             raop_transport,
+            raop_metadata_types,
+            raop_digest_auth,
+            vodka_version,
         })
     }
 
@@ -199,6 +352,16 @@ impl TxtRecordParser {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
         Ok(arr)
+    }
+
+    /// Parse a hex or decimal string to u64.
+    fn parse_hex_or_decimal(s: &str) -> u64 {
+        let s = s.trim();
+        if s.starts_with("0x") || s.starts_with("0X") {
+            u64::from_str_radix(&s[2..], 16).unwrap_or(0)
+        } else {
+            s.parse().unwrap_or(0)
+        }
     }
 
     /// Parse legacy 32-bit features from 'sf' field.
@@ -244,23 +407,45 @@ impl TxtRecordParser {
             } else {
                 airplay.model.clone()
             },
+            manufacturer: airplay.manufacturer.clone(),
+            serial_number: airplay.serial_number.clone(),
             addresses,
             port: airplay.port,
             features: airplay.features, // Prefer AirPlay features (64-bit)
-            public_key: airplay.public_key, // Only AirPlay has pk
+            required_sender_features: airplay.required_sender_features,
+            public_key: airplay.public_key.or(raop.public_key),
             source_version: if airplay.source_version == Version::default() {
                 raop.source_version
             } else {
                 airplay.source_version
             },
+            firmware_version: airplay.firmware_version.clone().or_else(|| raop.firmware_version.clone()),
+            os_version: airplay.os_version.clone().or_else(|| raop.os_version.clone()),
+            protocol_version: airplay.protocol_version.clone(),
             requires_password: airplay.requires_password || raop.requires_password,
+            status_flags: if airplay.status_flags != 0 { airplay.status_flags } else { raop.status_flags },
+            access_control: airplay.access_control,
+            pairing_identity: airplay.pairing_identity.clone(),
+            system_pairing_identity: airplay.system_pairing_identity.clone(),
+            bluetooth_address: airplay.bluetooth_address.clone(),
+            homekit_home_id: airplay.homekit_home_id.clone(),
             group_id: airplay.group_id,
             is_group_leader: airplay.is_group_leader,
+            group_public_name: airplay.group_public_name.clone(),
+            group_contains_discoverable_leader: airplay.group_contains_discoverable_leader,
+            home_group_id: airplay.home_group_id.clone(),
+            household_id: airplay.household_id.clone(),
+            parent_group_id: airplay.parent_group_id,
+            parent_group_contains_discoverable_leader: airplay.parent_group_contains_discoverable_leader,
+            tight_sync_id: airplay.tight_sync_id,
             // RAOP fields come from the RAOP record
             raop_port: raop.raop_port,
             raop_encryption_types: raop.raop_encryption_types.clone(),
             raop_codecs: raop.raop_codecs.clone(),
             raop_transport: raop.raop_transport.clone(),
+            raop_metadata_types: raop.raop_metadata_types.clone(),
+            raop_digest_auth: raop.raop_digest_auth,
+            vodka_version: raop.vodka_version.clone(),
         }
     }
 }
@@ -651,18 +836,40 @@ mod tests {
                 id: DeviceId([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]),
                 name: name.to_string(),
                 model: String::new(),
+                manufacturer: None,
+                serial_number: None,
                 addresses,
                 port: 7000,
                 features: Features::from_raw(features),
+                required_sender_features: None,
                 public_key,
                 source_version: Version::default(),
+                firmware_version: None,
+                os_version: None,
+                protocol_version: None,
                 requires_password: false,
+                status_flags: 0,
+                access_control: None,
+                pairing_identity: None,
+                system_pairing_identity: None,
+                bluetooth_address: None,
+                homekit_home_id: None,
                 group_id: None,
                 is_group_leader: false,
+                group_public_name: None,
+                group_contains_discoverable_leader: false,
+                home_group_id: None,
+                household_id: None,
+                parent_group_id: None,
+                parent_group_contains_discoverable_leader: false,
+                tight_sync_id: None,
                 raop_port: None,
                 raop_encryption_types: None,
                 raop_codecs: None,
                 raop_transport: None,
+                raop_metadata_types: None,
+                raop_digest_auth: false,
+                vodka_version: None,
             }
         }
 
