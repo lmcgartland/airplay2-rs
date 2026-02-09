@@ -252,6 +252,18 @@ impl App {
             }
         }
 
+        // Clean disconnect: send TEARDOWN to all devices so they don't keep
+        // stale sessions. Without this, devices may reject or mishandle the
+        // next connection attempt (especially for group streaming).
+        info!("Sending TEARDOWN to all connected devices...");
+        if let Ok(mut client) = self.client.try_lock() {
+            if let Err(e) = client.disconnect().await {
+                tracing::warn!("Disconnect error during shutdown: {}", e);
+            } else {
+                info!("All devices disconnected cleanly");
+            }
+        }
+
         Ok(())
     }
 

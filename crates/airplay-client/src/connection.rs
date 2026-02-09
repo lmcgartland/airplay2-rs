@@ -932,8 +932,24 @@ impl Connection {
                             }
                         }
 
-                        // Wait briefly for initial offset calculation
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        // Wait for first real clock offset from BMCA slave loop.
+                        // The slave loop needs a full Sync/Follow_Up/Delay_Req/Delay_Resp
+                        // exchange (~1-2s) before it can calculate the offset. A blind 500ms
+                        // sleep often reads zero, causing group sync packets to use wrong timestamps.
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            offset_rx.changed(),
+                        ).await {
+                            Ok(Ok(())) => {
+                                tracing::info!("BMCA: First clock offset received from slave loop");
+                            }
+                            Ok(Err(_)) => {
+                                tracing::warn!("BMCA: offset channel closed before first offset");
+                            }
+                            Err(_) => {
+                                tracing::warn!("BMCA: Timeout waiting for first clock offset (5s), using zero");
+                            }
+                        }
                         let initial_offset = *offset_rx.borrow_and_update();
                         self.timing_offset = Some(initial_offset);
 
@@ -1078,11 +1094,17 @@ impl Connection {
         if self.render_delay_ms > 0 {
             streamer.set_render_delay_ms(self.render_delay_ms).await;
         }
-        if let Some(offset) = self.timing_offset {
-            streamer.set_timing_offset(offset).await;
-        }
+        // Use live watch channel for current offset (not stale setup-time value).
+        // The BMCA slave loop continuously updates the offset, so the watch channel
+        // has the latest value — much better than the snapshot from setup() time.
         if let Some(ref tx) = self.timing_tx {
-            streamer.set_timing_updates(tx.subscribe()).await;
+            let rx = tx.subscribe();
+            let current_offset = *rx.borrow();
+            tracing::info!("Streaming: using live PTP offset = {} ns", current_offset.offset_ns);
+            streamer.set_timing_offset(current_offset).await;
+            streamer.set_timing_updates(rx).await;
+        } else if let Some(offset) = self.timing_offset {
+            streamer.set_timing_offset(offset).await;
         }
         // Enable PTP sync mode (PT=87) if we have a remote clock ID from BMCA
         if self.stream_config.timing_protocol == TimingProtocol::Ptp {
@@ -1261,11 +1283,17 @@ impl Connection {
         if self.render_delay_ms > 0 {
             streamer.set_render_delay_ms(self.render_delay_ms).await;
         }
-        if let Some(offset) = self.timing_offset {
-            streamer.set_timing_offset(offset).await;
-        }
+        // Use live watch channel for current offset (not stale setup-time value).
+        // The BMCA slave loop continuously updates the offset, so the watch channel
+        // has the latest value — much better than the snapshot from setup() time.
         if let Some(ref tx) = self.timing_tx {
-            streamer.set_timing_updates(tx.subscribe()).await;
+            let rx = tx.subscribe();
+            let current_offset = *rx.borrow();
+            tracing::info!("Streaming: using live PTP offset = {} ns", current_offset.offset_ns);
+            streamer.set_timing_offset(current_offset).await;
+            streamer.set_timing_updates(rx).await;
+        } else if let Some(offset) = self.timing_offset {
+            streamer.set_timing_offset(offset).await;
         }
 
         // Set up equalizer if configured

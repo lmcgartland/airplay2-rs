@@ -665,12 +665,15 @@ impl AirPlayClient {
         let mut streamer = AudioStreamer::new(self.stream_config.clone());
         streamer.set_rtp_senders(senders).await;
 
-        // Configure timing
-        if let Some(offset) = connection.timing_offset() {
-            streamer.set_timing_offset(offset).await;
-        }
+        // Configure timing — use live watch channel for current offset
         if let Some(rx) = connection.timing_rx() {
+            let current_offset = *rx.borrow();
+            tracing::info!("Group file streaming: using live PTP offset = {} ns", current_offset.offset_ns);
+            streamer.set_timing_offset(current_offset).await;
             streamer.set_timing_updates(rx).await;
+        } else if let Some(offset) = connection.timing_offset() {
+            tracing::warn!("Group file streaming: no live timing channel, using stale offset = {} ns", offset.offset_ns);
+            streamer.set_timing_offset(offset).await;
         }
         streamer.set_ptp_sync_mode(ptp_clock_id).await;
         if self.render_delay_ms > 0 {
@@ -691,8 +694,7 @@ impl AirPlayClient {
             }
         }
 
-        // NOW send FLUSH + RECORD, right before start. Minimizes the gap between
-        // "device resets state" and "first audio packet arrives".
+        // FLUSH clears device buffer state, then RECORD re-arms each device.
         if let Some(ref mut conn) = self.connection {
             if let Err(e) = conn.send_flush(0, 0).await {
                 tracing::warn!("FLUSH failed on primary: {}", e);
@@ -703,21 +705,12 @@ impl AirPlayClient {
                 tracing::warn!("FLUSH failed on group member {}: {}", i, e);
             }
         }
+        // Re-send RECORD after FLUSH to re-arm devices for audio
         if let Some(ref mut conn) = self.connection {
-            if let Err(e) = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                conn.send_record(),
-            ).await {
-                tracing::warn!("RECORD timeout on primary: {}", e);
-            }
+            conn.send_record().await.ok();
         }
-        for (i, conn) in self.group_connections.iter_mut().enumerate() {
-            if let Err(e) = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                conn.send_record(),
-            ).await {
-                tracing::warn!("RECORD timeout on group member {}: {}", i, e);
-            }
+        for conn in self.group_connections.iter_mut() {
+            conn.send_record().await.ok();
         }
 
         // Open audio file and start streaming
@@ -782,12 +775,18 @@ impl AirPlayClient {
         let mut streamer = AudioStreamer::new(self.stream_config.clone());
         streamer.set_rtp_senders(senders).await;
 
-        // Configure timing
-        if let Some(offset) = connection.timing_offset() {
-            streamer.set_timing_offset(offset).await;
-        }
+        // Configure timing — use live watch channel for current offset, not stale
+        // setup-time value. The BMCA slave loop has been running since connect_group()
+        // and the watch channel has the latest offset, while connection.timing_offset()
+        // returns a snapshot from setup time (which may have been zero).
         if let Some(rx) = connection.timing_rx() {
+            let current_offset = *rx.borrow();
+            tracing::info!("Group streaming: using live PTP offset = {} ns", current_offset.offset_ns);
+            streamer.set_timing_offset(current_offset).await;
             streamer.set_timing_updates(rx).await;
+        } else if let Some(offset) = connection.timing_offset() {
+            tracing::warn!("Group streaming: no live timing channel, using stale offset = {} ns", offset.offset_ns);
+            streamer.set_timing_offset(offset).await;
         }
         streamer.set_ptp_sync_mode(ptp_clock_id).await;
         if self.render_delay_ms > 0 {
@@ -808,9 +807,10 @@ impl AirPlayClient {
             }
         }
 
-        // NOW send FLUSH + RECORD, right before start_live. This minimizes the
-        // window between "device resets state" and "first audio packet arrives".
-        // RECORD re-arms devices that may have timed out since connect_group().
+        // FLUSH clears device buffer state, then RECORD re-arms each device to
+        // accept audio. This is needed because the original RECORD from connect_group()
+        // was sent 10+ seconds ago and FLUSH may invalidate it. Order matters:
+        // FLUSH first (clears old RECORD state), then RECORD (re-arms).
         if let Some(ref mut conn) = self.connection {
             if let Err(e) = conn.send_flush(0, 0).await {
                 tracing::warn!("FLUSH failed on primary: {}", e);
@@ -821,21 +821,12 @@ impl AirPlayClient {
                 tracing::warn!("FLUSH failed on group member {}: {}", i, e);
             }
         }
+        // Re-send RECORD after FLUSH to re-arm devices for audio
         if let Some(ref mut conn) = self.connection {
-            if let Err(e) = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                conn.send_record(),
-            ).await {
-                tracing::warn!("RECORD timeout on primary: {}", e);
-            }
+            conn.send_record().await.ok();
         }
-        for (i, conn) in self.group_connections.iter_mut().enumerate() {
-            if let Err(e) = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                conn.send_record(),
-            ).await {
-                tracing::warn!("RECORD timeout on group member {}: {}", i, e);
-            }
+        for conn in self.group_connections.iter_mut() {
+            conn.send_record().await.ok();
         }
 
         // Start live streaming — buffer fill + sender thread.
