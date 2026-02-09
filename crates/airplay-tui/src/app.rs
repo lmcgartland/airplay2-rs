@@ -284,6 +284,8 @@ impl App {
         match self.state.view {
             View::Devices => match key.code {
                 KeyCode::Char('r') => Some(Action::ScanDevices),
+                KeyCode::Char(' ') => Some(Action::ToggleDeviceSelect),
+                KeyCode::Char('x') if self.state.group.is_some() => Some(Action::DisbandGroup),
                 _ => None,
             },
             View::Browser => match key.code {
@@ -318,15 +320,6 @@ impl App {
                 KeyCode::Char('>') => Some(Action::EqIncreaseGain),
                 _ => None,
             },
-            View::Group => match key.code {
-                KeyCode::Char('g') => Some(Action::CreateGroup),
-                KeyCode::Char('a') => Some(Action::AddToGroup),
-                KeyCode::Char('d') => Some(Action::RemoveFromGroup),
-                KeyCode::Char('x') => Some(Action::DisbandGroup),
-                KeyCode::Char('+') | KeyCode::Char('=') => Some(Action::VolumeUp),
-                KeyCode::Char('-') => Some(Action::VolumeDown),
-                _ => None,
-            },
             #[cfg(feature = "usb-audio")]
             View::UsbAudio => match key.code {
                 KeyCode::Char('r') => Some(Action::UsbAudioRefreshDevices),
@@ -342,6 +335,7 @@ impl App {
                 KeyCode::Char('d') => Some(Action::BluetoothDisconnect),
                 KeyCode::Char('u') => Some(Action::BluetoothStartSource),
                 KeyCode::Char('i') => Some(Action::BluetoothAutoInstall),
+                KeyCode::Char('o') => Some(Action::BluetoothTogglePower),
                 _ => None,
             },
         }
@@ -432,6 +426,7 @@ impl App {
             }
             Action::Connected(device) => {
                 info!("Connected to device: {}", device.name);
+                self.state.connecting = false;
                 self.state.connected_device = Some(device.clone());
                 self.state.set_status(StatusMessage::info(format!(
                     "Connected to {}",
@@ -454,16 +449,26 @@ impl App {
                 }
             }
             Action::Disconnected => {
-                info!("Disconnected from device");
-                self.state.connected_device = None;
-                self.state.playback_state = PlaybackState::Stopped;
-                for entry in &mut self.state.devices {
-                    entry.is_connected = false;
+                // Ignore spurious disconnects during connect/reconnect flow.
+                // connect_group() internally disconnects before reconnecting,
+                // which emits Disconnected before Connected/GroupConnected.
+                if self.state.connecting {
+                    debug!("Ignoring Disconnected during connect flow");
+                } else {
+                    info!("Disconnected from device");
+                    self.state.connected_device = None;
+                    self.state.playback_state = PlaybackState::Stopped;
+                    self.state.group = None;
+                    for entry in &mut self.state.devices {
+                        entry.is_connected = false;
+                        entry.is_selected = false;
+                    }
+                    self.state.set_status(StatusMessage::info("Disconnected"));
                 }
-                self.state.set_status(StatusMessage::info("Disconnected"));
             }
             Action::Error(e) => {
                 error!("Error: {}", e);
+                self.state.connecting = false;
                 self.state.set_status(StatusMessage::error(e));
             }
 
@@ -560,9 +565,6 @@ impl App {
             }
 
             // Group actions
-            Action::OpenGroup => {
-                self.state.view = View::Group;
-            }
             Action::CreateGroup => {
                 info!("Creating group");
                 self.create_group().await;
@@ -594,6 +596,45 @@ impl App {
                 let client = self.client.lock().await;
                 self.state.update_group(client.group());
             }
+            Action::ToggleDeviceSelect => {
+                if let Some(entry) = self.state.devices.get_mut(self.state.device_index) {
+                    entry.is_selected = !entry.is_selected;
+                    let name = entry.device.name.clone();
+                    let selected = entry.is_selected;
+                    debug!("Device {} selection: {}", name, selected);
+                }
+            }
+            Action::ConnectGroup => {
+                self.connect_group().await;
+            }
+            Action::GroupConnected { device_count } => {
+                info!("Group connected with {} devices", device_count);
+                self.state.connecting = false;
+                self.state.set_status(StatusMessage::info(format!(
+                    "Group connected: {} devices",
+                    device_count
+                )));
+                let client = self.client.lock().await;
+                // Set connected_device from client (authoritative source)
+                if let Some(device) = client.connected_device() {
+                    self.state.connected_device = Some(device.clone());
+                }
+                self.state.update_group(client.group());
+                // Mark group devices as connected using client's group info
+                if let Some(group) = client.group() {
+                    let leader_id = group.leader().device.id.clone();
+                    let member_ids: Vec<_> = group.members().map(|m| m.device.id.clone()).collect();
+                    for entry in &mut self.state.devices {
+                        if entry.device.id == leader_id || member_ids.contains(&entry.device.id) {
+                            entry.is_connected = true;
+                        }
+                    }
+                }
+            }
+            Action::PlayFileToGroup(path) => {
+                info!("Play file to group: {:?}", path);
+                self.play_file_to_group(path).await;
+            }
 
             // File browser actions
             Action::NavigateDir(path) => {
@@ -602,7 +643,15 @@ impl App {
             }
             Action::FileSelected(path) => {
                 info!("File selected: {:?}", path);
-                self.play_file(path).await;
+                let is_group = {
+                    let client = self.client.lock().await;
+                    client.is_group_connected()
+                };
+                if is_group {
+                    self.play_file_to_group(path).await;
+                } else {
+                    self.play_file(path).await;
+                }
             }
 
             // Status
@@ -612,6 +661,7 @@ impl App {
             }
             Action::ShowError(msg) => {
                 warn!("Error status: {}", msg);
+                self.state.connecting = false;
                 self.state.set_status(StatusMessage::error(msg));
             }
             Action::ClearStatus => {
@@ -650,10 +700,11 @@ impl App {
             Action::Tick => {
                 self.state.clear_expired_status();
 
-                // Update playback position and state
+                // Update playback position, state, and stream stats
                 if let Ok(mut client) = self.client.try_lock() {
                     self.state.position = client.playback_position();
                     self.state.playback_state = client.playback_state();
+                    self.state.stream_stats = client.stats_snapshot();
 
                     // Send feedback every ~2 seconds during playback to maintain session
                     if self.state.playback_state == PlaybackState::Playing {
@@ -755,6 +806,14 @@ impl App {
 
             #[cfg(feature = "usb-audio")]
             Action::UsbAudioStartSource => {
+                // Auto-select highlighted device if none explicitly selected
+                if self.state.usb_audio.selected_device.is_none() {
+                    if let Some(device) = self.state.usb_audio.highlighted_device().cloned() {
+                        info!("Auto-selecting highlighted USB device: {}", device.name);
+                        self.state.usb_audio.selected_device = Some(device);
+                    }
+                }
+
                 if let Some(ref device) = self.state.usb_audio.selected_device.clone() {
                     let client_connected = {
                         let client = self.client.lock().await;
@@ -767,6 +826,9 @@ impl App {
                     }
 
                     info!("Starting USB audio source from {}", device.name);
+                    self.state.set_status(StatusMessage::info(format!(
+                        "Starting {}...", device.name
+                    )));
 
                     // Stop any existing capture thread
                     if let Some(ref shared) = self.usb_capture_shared {
@@ -778,6 +840,18 @@ impl App {
                         let _ = handle.join();
                     }
                     self.usb_capture_shared = None;
+
+                    // Ensure RTSP session is ready BEFORE starting capture
+                    // This avoids the race where capture fills buffers during slow setup
+                    {
+                        let mut client = self.client.lock().await;
+                        client.set_render_delay_ms(500);
+                        let eq_config = self.state.eq.config.clone();
+                        let eq_params = Arc::clone(&self.state.eq.params);
+                        if let Err(e) = client.set_eq_params(eq_config, eq_params) {
+                            warn!("Failed to set EQ params for USB streaming: {}", e);
+                        }
+                    }
 
                     let device_index = device.device_index;
                     let sample_rate = device.sample_rate;
@@ -852,20 +926,19 @@ impl App {
                                 })
                                 .expect("Failed to spawn USB capture thread");
 
-                            // Pre-fill buffer
-                            info!("Waiting for USB capture buffer to pre-fill...");
-                            std::thread::sleep(Duration::from_millis(500));
-                            info!("Pre-fill complete, starting AirPlay streaming");
+                            // No manual pre-fill wait needed: AudioStreamer::start_live() has its
+                            // own 50% buffer fill loop that properly waits for data from the
+                            // LiveAudioDecoder channel. Waiting here would fill the bounded
+                            // channel (64 frames) and cause frame drops before the streamer
+                            // starts consuming.
 
                             let stream_result = {
                                 let mut client = self.client.lock().await;
-                                client.set_render_delay_ms(500);
-                                let eq_config = self.state.eq.config.clone();
-                                let eq_params = Arc::clone(&self.state.eq.params);
-                                if let Err(e) = client.set_eq_params(eq_config, eq_params) {
-                                    warn!("Failed to set EQ params for USB streaming: {}", e);
+                                if client.is_group_connected() {
+                                    client.start_live_streaming_to_group(decoder).await
+                                } else {
+                                    client.start_live_streaming_with_decoder(decoder).await
                                 }
-                                client.start_live_streaming_with_decoder(decoder).await
                             };
 
                             match stream_result {
@@ -995,13 +1068,17 @@ impl App {
             Action::BluetoothInitAdapter => {
                 debug!("Initializing Bluetooth adapter");
 
-                self.state.bluetooth.adapter_powered = true;
                 self.state.bluetooth.adapter_name = Some("hci0".to_string());
 
-                // Load paired devices automatically
+                // Check actual adapter power state and load paired devices
                 let tx = self.action_tx.clone();
                 tokio::spawn(async move {
-                                        let devices: Vec<crate::state::BluetoothDeviceEntry> =
+                    let powered = bluetooth_helper::is_adapter_powered().await;
+                    let _ = tx.send(Action::BluetoothAdapterReady {
+                        name: "hci0".to_string(),
+                        powered,
+                    });
+                    let devices: Vec<crate::state::BluetoothDeviceEntry> =
                         bluetooth_helper::get_paired_devices().await;
                     info!("Found {} paired devices", devices.len());
                     let _ = tx.send(Action::BluetoothDevicesScanned(devices));
@@ -1012,6 +1089,29 @@ impl App {
             Action::BluetoothAdapterReady { name, powered } => {
                 self.state.bluetooth.adapter_name = Some(name);
                 self.state.bluetooth.adapter_powered = powered;
+            }
+
+            #[cfg(feature = "bluetooth")]
+            Action::BluetoothTogglePower => {
+                let new_state = !self.state.bluetooth.adapter_powered;
+                let action_word = if new_state { "on" } else { "off" };
+                info!("Toggling Bluetooth adapter power {}", action_word);
+                self.state.set_status(StatusMessage::info(format!(
+                    "Turning Bluetooth {}...", action_word
+                )));
+
+                let tx = self.action_tx.clone();
+                tokio::spawn(async move {
+                    match bluetooth_helper::set_adapter_power(new_state).await {
+                        Ok(()) => {
+                            let name = "hci0".to_string();
+                            let _ = tx.send(Action::BluetoothAdapterReady { name, powered: new_state });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Action::BluetoothError(format!("Power toggle failed: {}", e)));
+                        }
+                    }
+                });
             }
 
             #[cfg(feature = "bluetooth")]
@@ -1262,13 +1362,9 @@ impl App {
                                 })
                                 .expect("Failed to spawn capture thread");
 
-                            // Wait for channel to pre-fill before starting streaming
-                            // This ensures the streamer has audio data when it starts
-                            info!("Waiting for capture buffer to pre-fill...");
-                            std::thread::sleep(Duration::from_millis(500));
-                            info!("Pre-fill complete, starting AirPlay streaming");
-
-                            // Now start streaming with the pre-filled decoder
+                            // No manual pre-fill wait needed: AudioStreamer::start_live() has its
+                            // own 50% buffer fill loop that properly waits for data from the
+                            // LiveAudioDecoder channel.
                             // Set a moderate render delay (500ms) for live streaming to give
                             // the AirPlay receiver time to build its jitter buffer
                             let stream_result = {
@@ -1280,7 +1376,11 @@ impl App {
                                 if let Err(e) = client.set_eq_params(eq_config, eq_params) {
                                     warn!("Failed to set EQ params for live streaming: {}", e);
                                 }
-                                client.start_live_streaming_with_decoder(decoder).await
+                                if client.is_group_connected() {
+                                    client.start_live_streaming_to_group(decoder).await
+                                } else {
+                                    client.start_live_streaming_with_decoder(decoder).await
+                                }
                             };
 
                             match stream_result {
@@ -1384,27 +1484,36 @@ impl App {
     async fn handle_select(&mut self) {
         match self.state.view {
             View::Devices => {
-                info!("Selecting device");
-                self.connect_to_selected().await;
+                let selected_count = self.state.devices.iter()
+                    .filter(|e| e.is_selected)
+                    .count();
+                if selected_count >= 2 {
+                    info!("Connecting group ({} selected)", selected_count);
+                    self.connect_group().await;
+                } else {
+                    info!("Connecting to device");
+                    self.connect_to_selected().await;
+                }
             }
             View::Browser => {
                 debug!("Browser select, current entry: {:?}",
                     self.browser.selected_entry().map(|e| &e.name));
                 if let Some(path) = self.browser.activate() {
                     info!("Playing file from browser: {:?}", path);
-                    self.play_file(path).await;
+                    let is_group = {
+                        let client = self.client.lock().await;
+                        client.is_group_connected()
+                    };
+                    if is_group {
+                        self.play_file_to_group(path).await;
+                    } else {
+                        self.play_file(path).await;
+                    }
                 }
             }
             View::Player => {
                 debug!("Player select - toggle playback");
                 self.toggle_playback().await;
-            }
-            View::Group => {
-                // Toggle device selection for group creation
-                if let Some(entry) = self.state.devices.get_mut(self.state.device_index) {
-                    entry.is_selected = !entry.is_selected;
-                    debug!("Toggled device selection: {} = {}", entry.device.name, entry.is_selected);
-                }
             }
             #[cfg(feature = "usb-audio")]
             View::UsbAudio => {
@@ -1455,6 +1564,7 @@ impl App {
     async fn connect_to_selected(&mut self) {
         if let Some(device) = self.state.selected_device().cloned() {
             info!("Connecting to device: {} at {:?}", device.name, device.addresses);
+            self.state.connecting = true;
             self.state.set_status(StatusMessage::info(format!(
                 "Connecting to {}...",
                 device.name
@@ -1475,6 +1585,7 @@ impl App {
                 }
                 Ok(Err(e)) => {
                     error!("Connection failed: {}", e);
+                    self.state.connecting = false;
                     self.state.set_status(StatusMessage::error(format!(
                         "Connection failed: {}",
                         e
@@ -1482,6 +1593,7 @@ impl App {
                 }
                 Err(_) => {
                     error!("Connection timed out after 30 seconds");
+                    self.state.connecting = false;
                     self.state.set_status(StatusMessage::error(
                         "Connection timed out"
                     ));
@@ -1603,6 +1715,100 @@ impl App {
                     let _ = tx.send(Action::ShowError(
                         "Playback start timed out".to_string(),
                     ));
+                }
+            }
+        });
+    }
+
+    /// Connect to all selected devices as a synchronized group.
+    #[instrument(skip(self), name = "connect_group")]
+    async fn connect_group(&mut self) {
+        let selected_devices: Vec<Device> = self.state.devices.iter()
+            .filter(|e| e.is_selected)
+            .map(|e| e.device.clone())
+            .collect();
+
+        if selected_devices.len() < 2 {
+            self.state.set_status(StatusMessage::error(
+                "Select at least 2 devices (Space to toggle, g to connect group)"
+            ));
+            return;
+        }
+
+        let device_count = selected_devices.len();
+        self.state.connecting = true;
+        self.state.set_status(StatusMessage::info(format!(
+            "Connecting group ({} devices)...", device_count
+        )));
+
+        let client = Arc::clone(&self.client);
+        let tx = self.action_tx.clone();
+
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(Duration::from_secs(60), async {
+                let mut client = client.lock().await;
+                client.connect_group(&selected_devices).await
+            }).await;
+
+            match result {
+                Ok(Ok(())) => {
+                    let _ = tx.send(Action::GroupConnected { device_count });
+                }
+                Ok(Err(e)) => {
+                    error!("Group connect failed: {}", e);
+                    let _ = tx.send(Action::ShowError(format!("Group connect failed: {}", e)));
+                }
+                Err(_) => {
+                    error!("Group connect timed out");
+                    let _ = tx.send(Action::ShowError("Group connect timed out".to_string()));
+                }
+            }
+        });
+    }
+
+    /// Play an audio file to all group devices simultaneously.
+    #[instrument(skip(self), name = "play_file_to_group")]
+    async fn play_file_to_group(&mut self, path: PathBuf) {
+        let is_group = {
+            let client = self.client.lock().await;
+            client.is_group_connected()
+        };
+
+        if !is_group {
+            warn!("Cannot play to group - no group connected");
+            self.state.set_status(StatusMessage::error("No group connected"));
+            return;
+        }
+
+        let file_name = path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+
+        let duration = audio_info::get_audio_duration(&path);
+        self.state.duration = duration;
+        self.state.current_file = Some(path.display().to_string());
+        self.state.set_status(StatusMessage::info(format!("Playing {} to group...", file_name)));
+
+        let client = Arc::clone(&self.client);
+        let tx = self.action_tx.clone();
+
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(Duration::from_secs(30), async {
+                let mut client = client.lock().await;
+                client.play_file_to_group(&path).await
+            }).await;
+
+            match result {
+                Ok(Ok(())) => {
+                    let _ = tx.send(Action::PlaybackStarted);
+                }
+                Ok(Err(e)) => {
+                    error!("Group playback failed: {}", e);
+                    let _ = tx.send(Action::ShowError(format!("Group playback failed: {}", e)));
+                }
+                Err(_) => {
+                    error!("Group playback start timed out");
+                    let _ = tx.send(Action::ShowError("Group playback start timed out".to_string()));
                 }
             }
         });

@@ -4,9 +4,10 @@ An open-source Rust implementation of an AirPlay 2 audio transmitter (sender).
 
 ## Project Status
 
-**Pre-alpha** (as of January 2026).
+**Alpha** (as of February 2026).
 
 - Discovery, pairing, RTSP session setup, and audio streaming are functional.
+- PTP timing and multi-room group streaming are working (tested with HomePod Mini and Samsung TV).
 - Many modules still contain `todo!()` stubs.
 - The public API is **unstable**.
 
@@ -106,13 +107,33 @@ cargo run -p airplay-client --example play_audio -- <ip> <port> <audio-file> --a
 # AirPlay 2 (HomeKit pairing, NTP timing)
 cargo run -p airplay-client --example play_audio -- <ip> <port> <audio-file> --airplay2
 
-# AirPlay 2 with PTP timing (NOT WORKING YET)
-cargo run -p airplay-client --example play_audio -- <ip> <port> <audio-file> --airplay2 --ptp
+# AirPlay 2 with PTP timing (requires sudo for ports 319/320)
+sudo cargo run -p airplay-client --example play_audio -- <ip> <port> <audio-file> --airplay2 --ptp
 ```
 
 Supported audio formats: MP3, FLAC, WAV, AAC, ALAC, Ogg Vorbis, and more (via symphonia).
 
-### 4. Debug RTSP SETUP
+### 4. Play audio with PTP timing (HomePod)
+
+```bash
+# Uses BMCA yield flow: sender starts as master (Priority1=250), yields to
+# HomePod (Priority1=248), then syncs as PTP slave
+sudo cargo run -p airplay-client --example test_gptp -- <ip> 7000 <audio-file>
+```
+
+### 5. Multi-room group streaming
+
+```bash
+# Stream to multiple devices simultaneously (requires sudo for PTP)
+sudo cargo run -p airplay-client --example test_group -- <ip1> <ip2> <audio-file>
+
+# Non-standard ports supported (e.g., Samsung TV uses port 33330)
+sudo cargo run -p airplay-client --example test_group -- <ip1>:7000 <ip2>:33330 <audio-file>
+```
+
+Tested with HomePod Mini + Samsung TV. Stereo pair members cannot be targeted individually.
+
+### 6. Debug RTSP SETUP
 
 ```bash
 cargo run -p airplay-client --example debug_setup -- <ip> <port>
@@ -120,7 +141,7 @@ cargo run -p airplay-client --example debug_setup -- <ip> <port>
 
 Connects, pairs, and runs the two-phase RTSP SETUP handshake with verbose logging.
 
-### 5. Terminal UI
+### 7. Terminal UI
 
 ```bash
 cargo run -p airplay-tui
@@ -130,7 +151,7 @@ cargo run -p airplay-tui -- --debug
 cargo run -p airplay-tui -- --debug --log-file /tmp/airplay.log
 ```
 
-Full terminal interface with device browser, file picker, playback controls, and multi-room group management.
+Full terminal interface with device browser, file picker, playback controls, multi-room group management, and Bluetooth A2DP input (Linux only).
 
 ## Timing Synchronization: PTP vs NTP
 
@@ -151,30 +172,29 @@ NTP timing uses a simple request-response protocol on an ephemeral UDP port nego
 cargo run -p airplay-client --example play_audio -- <ip> <port> <file> --airplay2
 ```
 
-### PTP Timing (Multi-room) ⚠️ Experimental
+### PTP Timing (Multi-room) Working
 
 **When to use**: AirPlay 2 multi-room synchronization and HomePod.
 
-**Status**: PTP implementation is in progress but not yet confirmed working with real devices.
+**Status**: Working with HomePod Mini and other PTP-capable devices using BMCA yield flow.
 
-PTP (IEEE 1588) is intended to provide sub-millisecond synchronization required for multi-room audio:
-- Uses UDP ports **319** (event) and **320** (general) - these are privileged ports
-- Implements IEEE 1588 protocol with Sync, Follow_Up, Delay_Req, Delay_Resp, and Announce messages
-- The sender acts as PTP master (sending Sync messages) or slave (syncing to receiver's clock)
+PTP (IEEE 1588) provides sub-millisecond synchronization required for multi-room audio:
+- Uses UDP ports **319** (event) and **320** (general) - these are privileged ports requiring `sudo`
+- Implements IEEE 1588 BMCA (Best Master Clock Algorithm) yield flow
+- The sender starts as PTP master (Priority1=250), sends 3 Syncs + 2 Announces, then yields to the receiver (Priority1=248) and syncs as PTP slave
+- Uses PT=87 sync packets (28 bytes, PTP clock time + master clock ID) for audio synchronization
 - Required by HomePod and devices advertising `SupportsPTP` (feature bit 41)
 
 **Usage**:
 ```bash
 # Requires root/sudo for privileged ports 319/320
-sudo cargo run -p airplay-client --example play_audio -- <ip> <port> <file> --airplay2 --ptp
+sudo cargo run -p airplay-client --example test_gptp -- <ip> 7000 <audio-file>
 ```
-
-**Port fallback**: If ports 319/320 are unavailable, the code automatically falls back to ephemeral ports. However, some receivers (especially HomePod) may reject non-standard PTP ports.
 
 ### Implementation Notes
 
 - **NTP** is implemented in `crates/airplay-timing/src/ntp.rs` (working)
-- **PTP** is implemented in `crates/airplay-timing/src/ptp.rs` (experimental)
+- **PTP** is implemented in `crates/airplay-timing/src/ptp.rs` (working)
 - Both protocols implement the `TimingProtocol` trait for clock offset calculation
 - The timing protocol is negotiated during RTSP SETUP Phase 1 (`timingProtocol: "NTP"` or `timingProtocol: "PTP"`)
 
@@ -309,7 +329,7 @@ cargo run -p airplay-client --example play_audio -- <ip> 7000 <file> --airplay2 
 
 ## Notes
 
-- **HomePod**: Works with AirPlay 2 and NTP timing (`--airplay2`). PTP timing is experimental.
+- **HomePod**: Works with AirPlay 2 using either NTP timing (`--airplay2`) or PTP timing (`--airplay2 --ptp`). PTP is recommended for multi-room.
 - **Apple TV**: Requires PIN pairing on first connection. Use `--pin XXXX` flag after triggering PIN with `/pair-pin-start`.
 - **Transient pairing**: HomePod and HomeKit devices accept SRP transient pairing (M1-M4) with PIN `3939`. No pair-verify step is needed afterward.
 
@@ -325,7 +345,9 @@ airplay2-sender/
 │   ├── airplay-rtsp/        # RTSP protocol + session management
 │   ├── airplay-audio/       # Audio decoding, ALAC/AAC encoding, RTP
 │   ├── airplay-timing/      # PTP (IEEE 1588) and NTP synchronization
-│   ├── airplay-client/      # High-level client API
+│   ├── airplay-bluetooth/   # Bluetooth A2DP sink (Linux only)
+│   ├── airplay-resampler/   # Audio sample rate conversion
+│   ├── airplay-client/      # High-level client API + group streaming
 │   └── airplay-tui/         # Terminal user interface
 ```
 
@@ -391,7 +413,9 @@ Key dependencies (all pure Rust except FDK-AAC which compiles from vendored C so
 - `chacha20poly1305` - AEAD encryption
 - `num-bigint` - SRP big integer math
 - `plist` - Binary plist encoding
+- `rubato` - Audio sample rate conversion
 - `ratatui` - Terminal UI framework
+- `bluer` - BlueZ D-Bus interface for Bluetooth (Linux only)
 
 ## Bluetooth A2DP Sink (Raspberry Pi)
 

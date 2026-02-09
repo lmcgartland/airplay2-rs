@@ -220,13 +220,14 @@ impl LiveAudioDecoder {
                     }
                 }
                 None => {
-                    // No frame available - check if we have any samples
                     if collected_samples.is_empty() {
-                        // No residual, no new data - return None
                         return Ok(None);
                     }
-                    // Have some residual - pad with silence and return
-                    break;
+                    // Not enough samples for a full packet — save partial data
+                    // back to residual instead of padding with silence (which
+                    // causes audible pops). Next call will pick these up.
+                    self.residual_samples = collected_samples;
+                    return Ok(None);
                 }
             }
         }
@@ -239,9 +240,6 @@ impl LiveAudioDecoder {
         if collected_samples.len() > target_samples {
             self.residual_samples = collected_samples[target_samples..].to_vec();
             collected_samples.truncate(target_samples);
-        } else if collected_samples.len() < target_samples {
-            // Pad with silence if we don't have enough
-            collected_samples.resize(target_samples, 0);
         }
 
         // Scale timestamp from source sample rate to target sample rate

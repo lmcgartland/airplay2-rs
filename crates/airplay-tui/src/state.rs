@@ -1,7 +1,7 @@
 //! Application state management.
 
 use airplay_core::Device;
-use airplay_client::{PlaybackState, DeviceGroup, EqConfig, EqParams};
+use airplay_client::{PlaybackState, DeviceGroup, EqConfig, EqParams, StatsSnapshot};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,8 +15,6 @@ pub enum View {
     Browser,
     /// Now playing / playback controls.
     Player,
-    /// Multi-room group management.
-    Group,
     /// USB audio input source.
     #[cfg(feature = "usb-audio")]
     UsbAudio,
@@ -46,7 +44,6 @@ impl View {
             View::Devices => "Devices",
             View::Browser => "Browser",
             View::Player => "Player",
-            View::Group => "Group",
             #[cfg(feature = "usb-audio")]
             View::UsbAudio => "USB Audio",
             #[cfg(feature = "bluetooth")]
@@ -56,7 +53,8 @@ impl View {
 
     /// Get all views in order.
     pub fn all() -> Vec<View> {
-        let mut views = vec![View::Devices, View::Browser, View::Player, View::Group];
+        #[allow(unused_mut)]
+        let mut views = vec![View::Devices, View::Browser, View::Player];
         #[cfg(feature = "usb-audio")]
         views.push(View::UsbAudio);
         #[cfg(feature = "bluetooth")]
@@ -128,6 +126,8 @@ pub struct AppState {
     pub device_index: usize,
     /// Whether device scan is in progress.
     pub scanning: bool,
+    /// Whether a connection attempt is in progress.
+    pub connecting: bool,
     /// Connected device (if any).
     pub connected_device: Option<Device>,
 
@@ -148,6 +148,10 @@ pub struct AppState {
     pub group: Option<DeviceGroupState>,
     /// Selected index in group member list.
     pub group_member_index: usize,
+
+    // Stream stats
+    /// Packet loss / retransmit statistics.
+    pub stream_stats: StatsSnapshot,
 
     // Equalizer state
     /// Audio equalizer state.
@@ -482,6 +486,7 @@ impl Default for AppState {
             devices: Vec::new(),
             device_index: 0,
             scanning: false,
+            connecting: false,
             connected_device: None,
             playback_state: PlaybackState::Stopped,
             position: 0.0,
@@ -490,6 +495,7 @@ impl Default for AppState {
             current_file: None,
             group: None,
             group_member_index: 0,
+            stream_stats: StatsSnapshot::default(),
             eq: EqState::default(),
             #[cfg(feature = "usb-audio")]
             usb_audio: UsbAudioState::default(),
@@ -532,14 +538,6 @@ impl AppState {
                     self.device_index -= 1;
                 }
             }
-            View::Group => {
-                if let Some(ref group) = self.group {
-                    let count = group.members.len();
-                    if count > 0 && self.group_member_index > 0 {
-                        self.group_member_index -= 1;
-                    }
-                }
-            }
             #[cfg(feature = "usb-audio")]
             View::UsbAudio => {
                 self.usb_audio.select_prev();
@@ -558,14 +556,6 @@ impl AppState {
             View::Devices => {
                 if !self.devices.is_empty() && self.device_index < self.devices.len() - 1 {
                     self.device_index += 1;
-                }
-            }
-            View::Group => {
-                if let Some(ref group) = self.group {
-                    let count = group.members.len();
-                    if count > 0 && self.group_member_index < count - 1 {
-                        self.group_member_index += 1;
-                    }
                 }
             }
             #[cfg(feature = "usb-audio")]

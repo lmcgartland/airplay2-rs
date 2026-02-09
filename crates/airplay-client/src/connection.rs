@@ -11,15 +11,15 @@ use std::fs;
 // Timing imports reserved for future use
 // use airplay_timing::{TimingProtocol, NtpTimingClient, PtpClient};
 use airplay_audio::{AudioStreamer, AudioDecoder, LiveAudioDecoder, RtpSender, RtpReceiver, EqConfig, EqParams};
+use airplay_audio::cipher::{PacketCipher, ChaChaPacketCipher};
 use std::sync::Arc;
-use airplay_audio::cipher::ChaChaPacketCipher;
 use airplay_crypto::chacha::ControlCipher;
 use airplay_crypto::chacha::AudioCipher;
 use airplay_crypto::keys::SharedSecret;
 use crate::PlaybackState;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use tracing::{debug, info, warn};
-use airplay_timing::{NtpTimingServer, ClockOffset, PtpMaster, PTP_EVENT_PORT, run_ptp_slave, run_bmca_yield_flow};
+use airplay_timing::{NtpTimingServer, ClockOffset, PtpMaster, PTP_EVENT_PORT, run_ptp_slave, run_bmca_yield_flow, run_ptp_group_master_flow};
 use airplay_core::stream::TimingProtocol;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -177,6 +177,21 @@ fn is_link_local_v6(addr: &std::net::Ipv6Addr) -> bool {
     (segments[0] & 0xffc0) == 0xfe80
 }
 
+/// Parameters needed to send audio to a specific device in a group.
+///
+/// Each device in a group has its own encryption key (shk) and destination ports,
+/// but they all share the same PTP clock and RTP sequence space.
+pub struct StreamingParams {
+    /// UDP destination for audio data packets.
+    pub data_dest: SocketAddr,
+    /// UDP destination for control/sync packets.
+    pub control_dest: SocketAddr,
+    /// Per-device encryption cipher (unique shk per device).
+    pub cipher: Box<dyn PacketCipher>,
+    /// Control socket (sends sync from our declared control port).
+    pub control_socket: Option<UdpSocket>,
+}
+
 /// Active connection to an AirPlay device.
 pub struct Connection {
     device: Device,
@@ -207,6 +222,8 @@ pub struct Connection {
     eq_config: Option<EqConfig>,
     /// Shared equalizer parameters for real-time control.
     eq_params: Option<Arc<EqParams>>,
+    /// Stream statistics (shared with control channel threads).
+    stream_stats: Arc<crate::stats::StreamStats>,
 }
 
 impl Connection {
@@ -325,6 +342,7 @@ impl Connection {
             render_delay_ms: 0,
             eq_config: None,
             eq_params: None,
+            stream_stats: crate::stats::StreamStats::new(),
         })
     }
 
@@ -489,6 +507,7 @@ impl Connection {
             render_delay_ms: 0,
             eq_config: None,
             eq_params: None,
+            stream_stats: crate::stats::StreamStats::new(),
         })
     }
 
@@ -689,6 +708,7 @@ impl Connection {
             render_delay_ms: 0,
             eq_config: None,
             eq_params: None,
+            stream_stats: crate::stats::StreamStats::new(),
         })
     }
 
@@ -1023,44 +1043,8 @@ impl Connection {
             self.setup().await?;
         }
 
-        // Configure RTP sender
-        let ports = self.session.ports()
-            .ok_or_else(|| RtspError::SetupFailed("Missing ports from SETUP".into()))?;
-        tracing::debug!(
-            "Session ports: data={}, control={}, timing={}, event={}",
-            ports.data_port, ports.control_port, ports.timing_port, ports.event_port
-        );
-        let dest_addr = select_best_address(&self.device.addresses)
-            .ok_or_else(|| RtspError::ConnectionRefused)?;
-        let dest = SocketAddr::new(*dest_addr, ports.data_port);
-        let control_dest = SocketAddr::new(*dest_addr, ports.control_port);
-        let mut sender = RtpSender::new(dest, rand::random());
-        sender.set_control_dest(control_dest);
-        sender.bind(0)?;
-
-        // Give the sender a clone of our control socket so sync packets are sent
-        // from our declared control port (not the data socket's random port).
-        // The receiver expects sync to come from the port we advertised in SETUP.
-        if let Some(ref control_rx) = self.control_receiver {
-            if let Ok(Some(ctrl_sock)) = control_rx.try_clone_socket() {
-                let ctrl_port = ctrl_sock.local_addr().map(|a| a.port()).unwrap_or(0);
-                sender.set_control_socket(ctrl_sock);
-                tracing::info!("Sync packets will be sent from control port {}", ctrl_port);
-            } else {
-                tracing::warn!("Could not clone control socket for sync packets");
-            }
-        }
-
-        tracing::info!("RTP sender bound, data: {}, control: {}", dest, control_dest);
-
-        // Enable audio encryption (shk from SETUP)
-        let stream_key = *self.session.stream_key();
-        info!(
-            "DIAG AirPlay2 shk (first 16 bytes): {:02x?}",
-            &stream_key[..16]
-        );
-        let audio_cipher = AudioCipher::new(stream_key);
-        sender.set_cipher(Box::new(ChaChaPacketCipher::new(audio_cipher)));
+        // Configure RTP sender using shared builder
+        let sender = self.build_rtp_sender()?;
         info!("DIAG: ChaCha20-Poly1305 audio encryption enabled");
 
         // Start streamer
@@ -1119,6 +1103,7 @@ impl Connection {
             let control_rx_clone = Arc::clone(control_rx);
             let streamer_clone = streamer.clone();
             let rt_handle = tokio::runtime::Handle::current();
+            let stats = Arc::clone(&self.stream_stats);
 
             Some(tokio::task::spawn_blocking(move || {
                 tracing::debug!("Control channel thread started (5ms poll)");
@@ -1163,6 +1148,7 @@ impl Connection {
                                 };
 
                                 if let Some(request) = request {
+                                    stats.rtx_requested.fetch_add(request.count as u64, std::sync::atomic::Ordering::Relaxed);
                                     tracing::debug!(
                                         "Retransmit request: seq={}, count={}",
                                         request.first_sequence, request.count
@@ -1171,6 +1157,7 @@ impl Connection {
                                     match rt_handle.block_on(streamer_clone.handle_retransmit(&request)) {
                                         Ok(retransmitted) => {
                                             if retransmitted > 0 {
+                                                stats.rtx_fulfilled.fetch_add(retransmitted as u64, std::sync::atomic::Ordering::Relaxed);
                                                 tracing::info!(
                                                     "Retransmitted {} packets starting from seq {}",
                                                     retransmitted, request.first_sequence
@@ -1228,36 +1215,8 @@ impl Connection {
             self.setup().await?;
         }
 
-        // Configure RTP sender
-        let ports = self.session.ports()
-            .ok_or_else(|| RtspError::SetupFailed("Missing ports from SETUP".into()))?;
-        tracing::debug!(
-            "Session ports: data={}, control={}, timing={}, event={}",
-            ports.data_port, ports.control_port, ports.timing_port, ports.event_port
-        );
-        let dest_addr = select_best_address(&self.device.addresses)
-            .ok_or_else(|| RtspError::ConnectionRefused)?;
-        let dest = SocketAddr::new(*dest_addr, ports.data_port);
-        let control_dest = SocketAddr::new(*dest_addr, ports.control_port);
-        let mut sender = RtpSender::new(dest, rand::random());
-        sender.set_control_dest(control_dest);
-        sender.bind(0)?;
-
-        // Give the sender a clone of our control socket
-        if let Some(ref control_rx) = self.control_receiver {
-            if let Ok(Some(ctrl_sock)) = control_rx.try_clone_socket() {
-                let ctrl_port = ctrl_sock.local_addr().map(|a| a.port()).unwrap_or(0);
-                sender.set_control_socket(ctrl_sock);
-                tracing::info!("Sync packets will be sent from control port {}", ctrl_port);
-            }
-        }
-
-        tracing::info!("RTP sender bound for live streaming, data: {}, control: {}", dest, control_dest);
-
-        // Enable audio encryption
-        let stream_key = *self.session.stream_key();
-        let audio_cipher = AudioCipher::new(stream_key);
-        sender.set_cipher(Box::new(ChaChaPacketCipher::new(audio_cipher)));
+        // Configure RTP sender using shared builder
+        let sender = self.build_rtp_sender()?;
         info!("Live streaming: ChaCha20-Poly1305 audio encryption enabled");
 
         // Start streamer
@@ -1307,6 +1266,7 @@ impl Connection {
             let control_rx_clone = Arc::clone(control_rx);
             let streamer_clone = streamer.clone();
             let rt_handle = tokio::runtime::Handle::current();
+            let stats = Arc::clone(&self.stream_stats);
 
             Some(tokio::task::spawn_blocking(move || {
                 tracing::debug!("Control channel thread started for live streaming (5ms poll)");
@@ -1331,9 +1291,11 @@ impl Connection {
                                 };
 
                                 if let Some(request) = request {
+                                    stats.rtx_requested.fetch_add(request.count as u64, std::sync::atomic::Ordering::Relaxed);
                                     match rt_handle.block_on(streamer_clone.handle_retransmit(&request)) {
                                         Ok(retransmitted) => {
                                             if retransmitted > 0 {
+                                                stats.rtx_fulfilled.fetch_add(retransmitted as u64, std::sync::atomic::Ordering::Relaxed);
                                                 tracing::debug!(
                                                     "Retransmitted {} packets starting from seq {}",
                                                     retransmitted, request.first_sequence
@@ -1432,6 +1394,16 @@ impl Connection {
         Ok(())
     }
 
+    /// Get the total packets sent by this connection's streamer (0 if no streamer).
+    pub fn streamer_packets_sent(&self) -> u64 {
+        self.streamer.as_ref().map_or(0, |s| s.packets_sent())
+    }
+
+    /// Get the total buffer underruns from this connection's streamer (0 if no streamer).
+    pub fn streamer_underruns(&self) -> u64 {
+        self.streamer.as_ref().map_or(0, |s| s.underruns())
+    }
+
     /// Set render delay in milliseconds.
     ///
     /// Shifts NTP timestamps in sync packets into the future, telling the
@@ -1457,6 +1429,11 @@ impl Connection {
     /// Get a clone of the EQ params Arc if set.
     pub fn eq_params(&self) -> Option<Arc<EqParams>> {
         self.eq_params.clone()
+    }
+
+    /// Get a clone of the EQ config if set.
+    pub fn eq_config(&self) -> Option<EqConfig> {
+        self.eq_config.clone()
     }
 
     /// Set volume.
@@ -1495,12 +1472,418 @@ impl Connection {
         }
     }
 
+    /// Complete RTSP SETUP with PTP master mode for group streaming.
+    ///
+    /// This does the same RTSP setup as `setup()` but launches PTP as master
+    /// (priority1=246, wins against HomePod's 248) instead of BMCA yield flow
+    /// (priority1=250, loses to HomePod). All peer HomePods sync to our clock.
+    ///
+    /// `all_peer_ips` should include all HomePod IPs in the group (NOT our own IP).
+    pub async fn setup_as_ptp_master(&mut self, all_peer_ips: &[IpAddr]) -> Result<()> {
+        tracing::info!(
+            "RTSP setup start (PTP master mode, {} peers)",
+            all_peer_ips.len()
+        );
+
+        // SETUP Phase 1 (timing/event channels)
+        let local_timing_port = PTP_EVENT_PORT;
+        let local_addresses = self.rtsp.local_addr()
+            .map(|sa| vec![sa.ip().to_string()])
+            .unwrap_or_default();
+        let setup1_body = self.session.build_setup_phase1(local_timing_port, Some(local_addresses))?;
+        let setup1_req = RtspRequest::setup(self.session.request_uri(), setup1_body);
+        let setup1_resp = self.rtsp.send(setup1_req).await?;
+
+        if let Some(ref body) = setup1_resp.body {
+            tracing::debug!(
+                "SETUP phase 1 response: status={}, body_len={}",
+                setup1_resp.status_code, body.len()
+            );
+        }
+
+        self.session.process_setup_phase1_response(setup1_resp.body.as_deref().unwrap_or(&[]))?;
+
+        // Add RTSP Session header
+        let session_id = setup1_resp.headers.get("Session")
+            .cloned()
+            .unwrap_or_else(|| "1".to_string());
+        self.rtsp.add_session_header("Session", session_id);
+
+        // Establish events connection
+        let addr = *select_best_address(&self.device.addresses)
+            .ok_or_else(|| RtspError::ConnectionRefused)?;
+        let ports = self.session.ports()
+            .ok_or_else(|| CoreError::Rtsp(RtspError::InvalidResponse("No ports in SETUP response".into())))?;
+        let event_port = ports.event_port;
+
+        let events_addr = SocketAddr::new(addr, event_port);
+        tracing::info!("Establishing events connection to {}", events_addr);
+        match tokio::net::TcpStream::connect(events_addr).await {
+            Ok(stream) => {
+                tracing::info!("Events connection established");
+                self.events_stream = Some(stream);
+            }
+            Err(e) => {
+                warn!("Could not connect to events port {} (proceeding anyway): {}", events_addr, e);
+            }
+        }
+
+        // Bind control port
+        let mut control_receiver = RtpReceiver::new();
+        let actual_control_port = control_receiver.bind(0)?;
+        self.session.set_local_control_port(actual_control_port);
+        tracing::info!("Control port bound to {}", actual_control_port);
+        self.control_receiver = Some(Arc::new(control_receiver));
+
+        // SETUP Phase 2 (audio stream)
+        let setup2_body = self.session.build_setup_phase2()?;
+        let setup2_req = RtspRequest::setup(self.session.request_uri(), setup2_body);
+        let setup2_resp = self.rtsp.send(setup2_req).await?;
+        tracing::debug!(
+            "SETUP phase 2 response: status={}, body_len={}",
+            setup2_resp.status_code,
+            setup2_resp.body.as_ref().map(|b| b.len()).unwrap_or(0),
+        );
+        self.session.process_setup_phase2_response(setup2_resp.body.as_deref().unwrap_or(&[]))?;
+
+        // RECORD
+        let record_req = RtspRequest::record_with_info(
+            self.session.request_uri(),
+            0, 0,
+        );
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.rtsp.send(record_req)
+        ).await {
+            Ok(Ok(resp)) => {
+                if resp.status_code == 200 {
+                    tracing::info!("RECORD acknowledged");
+                } else {
+                    warn!("RECORD returned status {} (continuing)", resp.status_code);
+                }
+            }
+            Ok(Err(e)) => warn!("RECORD error (continuing): {}", e),
+            Err(_) => warn!("RECORD timeout (continuing)"),
+        }
+
+        // PTP master flow — we become grandmaster to all peers
+        let peer_ips_vec: Vec<IpAddr> = all_peer_ips.to_vec();
+        let (clock_id_tx, clock_id_rx) = tokio::sync::oneshot::channel::<[u8; 8]>();
+
+        // As PTP master, our offset is 0 (we ARE the reference clock)
+        let (offset_tx, _offset_rx) = watch::channel(ClockOffset::default());
+        self.timing_tx = Some(offset_tx);
+        self.timing_offset = Some(ClockOffset::default());
+
+        self.ptp_master_sync_task = Some(tokio::spawn(async move {
+            if let Err(e) = run_ptp_group_master_flow(
+                peer_ips_vec,
+                246,  // Priority1=246 — wins against HomePod's 248
+                clock_id_tx,
+            ).await {
+                tracing::error!("PTP group master flow error: {}", e);
+            }
+        }));
+
+        // Wait for BMCA to complete and get our clock identity
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            clock_id_rx,
+        ).await {
+            Ok(Ok(clock_id)) => {
+                self.ptp_master_clock_id = Some(clock_id);
+                tracing::info!("PTP master: our clock ID = {:02x?}", clock_id);
+            }
+            Ok(Err(_)) => {
+                tracing::warn!("PTP master: clock ID channel closed unexpectedly");
+            }
+            Err(_) => {
+                tracing::warn!("PTP master: timeout waiting for clock ID (8s)");
+            }
+        }
+
+        tracing::info!("PTP group master setup complete (offset=0, we are the clock)");
+        Ok(())
+    }
+
     /// Send SETPEERS for multi-room (addresses of all group members).
     pub async fn send_setpeers(&mut self, peer_addresses: &[String]) -> Result<()> {
         let setpeers_body = self.session.build_setpeers(peer_addresses)?;
         let setpeers_req = RtspRequest::setpeers(&self.session.id().to_string(), setpeers_body);
         self.rtsp.send(setpeers_req).await?;
         Ok(())
+    }
+
+    /// Complete RTSP SETUP for a secondary group member (no PTP).
+    ///
+    /// This does everything `setup()` does except PTP BMCA. Instead of running
+    /// BMCA on ports 319/320, it accepts the PTP clock state from the primary
+    /// connection. Only one connection per process can bind PTP ports.
+    ///
+    /// After setup, call `send_setpeers()` with all group member addresses.
+    pub async fn setup_for_group(
+        &mut self,
+        ptp_clock_id: [u8; 8],
+        timing_offset: ClockOffset,
+        timing_rx: watch::Receiver<ClockOffset>,
+    ) -> Result<()> {
+        tracing::info!(
+            "RTSP group setup start (stream_type={:?}, timing={:?})",
+            self.stream_config.stream_type,
+            self.stream_config.timing_protocol
+        );
+
+        // Use PTP_EVENT_PORT (319) — same as the primary. The PTP handler on port 319
+        // multiplexes multiple peers by source IP, so the secondary HomePod's PTP traffic
+        // is drained/logged but doesn't interfere with the primary's timing calculations.
+        let local_timing_port = PTP_EVENT_PORT;
+
+        // SETUP Phase 1 (timing/event channels)
+        let local_addresses = self.rtsp.local_addr()
+            .map(|sa| vec![sa.ip().to_string()])
+            .unwrap_or_default();
+        let setup1_body = self.session.build_setup_phase1(local_timing_port, Some(local_addresses))?;
+        tracing::debug!(
+            uri = %self.session.request_uri(),
+            body_len = setup1_body.len(),
+            "Sending SETUP phase 1 (group member)"
+        );
+        let setup1_req = RtspRequest::setup(self.session.request_uri(), setup1_body);
+        let setup1_resp = self.rtsp.send(setup1_req).await?;
+
+        if let Some(ref body) = setup1_resp.body {
+            tracing::debug!(
+                status = setup1_resp.status_code,
+                body_len = body.len(),
+                "SETUP phase 1 response received (group member)"
+            );
+        }
+
+        self.session.process_setup_phase1_response(setup1_resp.body.as_deref().unwrap_or(&[]))?;
+
+        // Add RTSP Session header
+        let session_id = setup1_resp.headers.get("Session")
+            .cloned()
+            .unwrap_or_else(|| "1".to_string());
+        self.rtsp.add_session_header("Session", session_id);
+
+        // Establish events connection
+        let addr = *select_best_address(&self.device.addresses)
+            .ok_or_else(|| RtspError::ConnectionRefused)?;
+        let ports = self.session.ports()
+            .ok_or_else(|| CoreError::Rtsp(RtspError::InvalidResponse("No ports in SETUP response".into())))?;
+        let event_port = ports.event_port;
+
+        let events_addr = SocketAddr::new(addr, event_port);
+        tracing::info!("Establishing events connection to {} (group member)", events_addr);
+        match TcpStream::connect(events_addr).await {
+            Ok(stream) => {
+                tracing::info!("Events connection established (group member)");
+                self.events_stream = Some(stream);
+            }
+            Err(e) => {
+                warn!("Could not connect to events port {} (proceeding anyway): {}", events_addr, e);
+            }
+        }
+
+        // Bind control port
+        let mut control_receiver = RtpReceiver::new();
+        let actual_control_port = control_receiver.bind(0)?;
+        self.session.set_local_control_port(actual_control_port);
+        tracing::info!("Control port bound to {} (group member)", actual_control_port);
+        self.control_receiver = Some(Arc::new(control_receiver));
+
+        // SETUP Phase 2 (audio stream — gets device-specific shk)
+        let setup2_body = self.session.build_setup_phase2()?;
+        let setup2_req = RtspRequest::setup(self.session.request_uri(), setup2_body);
+        let setup2_resp = self.rtsp.send(setup2_req).await?;
+        tracing::debug!(
+            "SETUP phase 2 response (group member): status={}, body_len={}",
+            setup2_resp.status_code,
+            setup2_resp.body.as_ref().map(|b| b.len()).unwrap_or(0),
+        );
+        self.session.process_setup_phase2_response(setup2_resp.body.as_deref().unwrap_or(&[]))?;
+
+        // RECORD
+        tracing::debug!("Sending RECORD request (group member)");
+        let record_req = RtspRequest::record_with_info(
+            self.session.request_uri(),
+            0,
+            0,
+        );
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.rtsp.send(record_req)
+        ).await {
+            Ok(Ok(resp)) => {
+                if resp.status_code == 200 {
+                    tracing::info!("RECORD acknowledged (group member)");
+                } else {
+                    warn!("RECORD returned status {} (group member, continuing)", resp.status_code);
+                }
+            }
+            Ok(Err(e)) => warn!("RECORD error (group member, continuing): {}", e),
+            Err(_) => warn!("RECORD timeout (group member, continuing)"),
+        }
+
+        // Inject PTP state from primary connection (no BMCA)
+        self.ptp_master_clock_id = Some(ptp_clock_id);
+        self.timing_offset = Some(timing_offset);
+        // Store a new sender that mirrors the primary's offset updates
+        let (local_tx, _) = watch::channel(timing_offset);
+        self.timing_tx = Some(local_tx);
+        // Spawn a task that forwards offset updates from the primary's channel
+        let local_tx_clone = self.timing_tx.as_ref().unwrap().clone();
+        let mut rx = timing_rx;
+        self.timing_task = Some(tokio::spawn(async move {
+            while rx.changed().await.is_ok() {
+                let offset = *rx.borrow();
+                let _ = local_tx_clone.send(offset);
+            }
+        }));
+
+        tracing::info!(
+            "Group member RTSP setup complete (clock_id={:02x?}, offset={} ns)",
+            ptp_clock_id, timing_offset.offset_ns
+        );
+        Ok(())
+    }
+
+    /// Send FLUSH to clear receiver buffers before streaming.
+    ///
+    /// This tells the receiver to discard any buffered audio and expect
+    /// fresh data starting at the given sequence/timestamp. Should be called
+    /// before starting manual streaming loops.
+    pub async fn send_flush(&mut self, seq: u16, rtptime: u32) -> Result<()> {
+        let flush_req = RtspRequest::flush_with_info(
+            self.session.request_uri(),
+            seq,
+            rtptime,
+        );
+        if let Err(e) = self.rtsp.send(flush_req).await {
+            tracing::warn!("FLUSH failed (continuing anyway): {}", e);
+        } else {
+            tracing::info!("FLUSH sent (seq={}, rtptime={})", seq, rtptime);
+        }
+        Ok(())
+    }
+
+    /// Send RECORD to resume playback on this connection.
+    pub async fn send_record(&mut self) -> Result<()> {
+        let record_req = RtspRequest::record(self.session.request_uri());
+        if let Err(e) = self.rtsp.send(record_req).await {
+            tracing::warn!("RECORD failed (continuing anyway): {}", e);
+        } else {
+            tracing::info!("RECORD sent");
+        }
+        Ok(())
+    }
+
+    /// Build a fully-configured RTP sender for this connection.
+    ///
+    /// Encapsulates the ~15 lines of sender setup duplicated in `start_streaming()`
+    /// and `start_streaming_live()`. The returned sender has:
+    /// - Destination set to the device's data port
+    /// - Control destination set to the device's control port
+    /// - Bound to an ephemeral local port with QoS
+    /// - Control socket cloned from our declared control receiver
+    /// - ChaCha20-Poly1305 cipher from the session's shk
+    /// - SSRC=0 per AirPlay spec
+    pub fn build_rtp_sender(&self) -> Result<RtpSender> {
+        let ports = self.session.ports()
+            .ok_or_else(|| RtspError::SetupFailed("Missing ports from SETUP".into()))?;
+        let dest_addr = select_best_address(&self.device.addresses)
+            .ok_or_else(|| RtspError::ConnectionRefused)?;
+        let dest = SocketAddr::new(*dest_addr, ports.data_port);
+        let control_dest = SocketAddr::new(*dest_addr, ports.control_port);
+
+        let mut sender = RtpSender::new(dest, 0); // SSRC=0 per AirPlay spec
+        sender.set_control_dest(control_dest);
+        sender.bind(0)?;
+
+        // Clone our control socket so sync packets come from the declared control port
+        if let Some(ref control_rx) = self.control_receiver {
+            if let Ok(Some(ctrl_sock)) = control_rx.try_clone_socket() {
+                let ctrl_port = ctrl_sock.local_addr().map(|a| a.port()).unwrap_or(0);
+                sender.set_control_socket(ctrl_sock);
+                tracing::info!("RTP sender: sync packets from control port {}", ctrl_port);
+            }
+        }
+
+        // Set up per-device ChaCha20-Poly1305 cipher from session shk
+        let stream_key = *self.session.stream_key();
+        let audio_cipher = AudioCipher::new(stream_key);
+        sender.set_cipher(Box::new(ChaChaPacketCipher::new(audio_cipher)));
+
+        tracing::info!("Built RTP sender: data={}, control={}", dest, control_dest);
+        Ok(sender)
+    }
+
+    /// Get streaming parameters for this connection (for multi-target sending).
+    ///
+    /// Returns the destination addresses, per-device cipher, and control socket
+    /// needed to send audio to this device from an external loop.
+    pub fn streaming_params(&self) -> Result<StreamingParams> {
+        let ports = self.session.ports()
+            .ok_or_else(|| RtspError::SetupFailed("Missing ports from SETUP".into()))?;
+        let dest_addr = select_best_address(&self.device.addresses)
+            .ok_or_else(|| RtspError::ConnectionRefused)?;
+
+        let data_dest = SocketAddr::new(*dest_addr, ports.data_port);
+        let control_dest = SocketAddr::new(*dest_addr, ports.control_port);
+
+        // Create a per-device cipher from the session's shk
+        let stream_key = *self.session.stream_key();
+        let audio_cipher = AudioCipher::new(stream_key);
+        let cipher: Box<dyn PacketCipher> = Box::new(ChaChaPacketCipher::new(audio_cipher));
+
+        // Clone control socket if available
+        let control_socket = if let Some(ref control_rx) = self.control_receiver {
+            control_rx.try_clone_socket().ok().flatten()
+        } else {
+            None
+        };
+
+        Ok(StreamingParams {
+            data_dest,
+            control_dest,
+            cipher,
+            control_socket,
+        })
+    }
+
+    /// Get the PTP master clock ID from BMCA yield (if available).
+    pub fn ptp_master_clock_id(&self) -> Option<[u8; 8]> {
+        self.ptp_master_clock_id
+    }
+
+    /// Get the current timing offset (if available).
+    pub fn timing_offset(&self) -> Option<ClockOffset> {
+        self.timing_offset
+    }
+
+    /// Get a receiver for timing offset updates (subscribes to the watch channel).
+    pub fn timing_rx(&self) -> Option<watch::Receiver<ClockOffset>> {
+        self.timing_tx.as_ref().map(|tx| tx.subscribe())
+    }
+
+    /// Get the RTSP connection's local address.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.rtsp.local_addr()
+    }
+
+    /// Get the stream stats for this connection.
+    pub fn stream_stats(&self) -> Arc<crate::stats::StreamStats> {
+        Arc::clone(&self.stream_stats)
+    }
+
+    /// Clone the control receiver socket for use in external retransmit listeners.
+    ///
+    /// Returns a cloned `UdpSocket` from the control receiver, which can be used
+    /// to poll for retransmit requests in the group streaming path.
+    pub fn clone_control_socket_for_recv(&self) -> Option<UdpSocket> {
+        self.control_receiver.as_ref()
+            .and_then(|rx| rx.try_clone_socket().ok().flatten())
     }
 }
 

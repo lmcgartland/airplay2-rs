@@ -18,10 +18,18 @@ pub fn render_player(frame: &mut Frame, area: Rect, state: &AppState) {
     // Adjust layout based on whether EQ is expanded
     let eq_height = if state.eq.expanded { 12 } else { 0 };
 
+    let per_device_lines = state.stream_stats.devices.iter()
+        .filter(|d| d.rtx_requested > 0 || d.rtx_fulfilled > 0)
+        .count() as u16;
+    let stats_height = if state.stream_stats.packets_sent > 0 {
+        6 + per_device_lines
+    } else {
+        5
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),        // Now playing info
+            Constraint::Length(stats_height), // Now playing info (+ stats line when streaming)
             Constraint::Length(3),        // Progress bar
             Constraint::Length(5),        // Controls / volume
             Constraint::Length(eq_height), // EQ (if expanded)
@@ -70,7 +78,7 @@ fn render_now_playing(frame: &mut Frame, area: Rect, state: &AppState) {
         .map(|d| d.name.as_str())
         .unwrap_or("Not connected");
 
-    let content = vec![
+    let mut content = vec![
         Line::from(Span::styled(title, status_style.add_modifier(Modifier::BOLD))),
         Line::from(vec![
             Span::styled("File: ", Style::default().fg(Color::DarkGray)),
@@ -81,6 +89,86 @@ fn render_now_playing(frame: &mut Frame, area: Rect, state: &AppState) {
             Span::styled(device_name, Style::default().fg(Color::Cyan)),
         ]),
     ];
+
+    // Show stream stats when actively streaming
+    let stats = &state.stream_stats;
+    if stats.packets_sent > 0 {
+        let loss = stats.loss_percent();
+        let loss_color = if loss > 1.0 {
+            Color::Red
+        } else if loss > 0.1 {
+            Color::Yellow
+        } else {
+            Color::Green
+        };
+        let underrun_color = if stats.underruns > 10 {
+            Color::Red
+        } else if stats.underruns > 0 {
+            Color::Yellow
+        } else {
+            Color::Green
+        };
+        content.push(Line::from(vec![
+            Span::styled("Sent: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{}", stats.packets_sent), Style::default().fg(Color::White)),
+            Span::styled("  RTX: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}/{}", stats.rtx_fulfilled, stats.rtx_requested),
+                Style::default().fg(loss_color),
+            ),
+            Span::styled(
+                format!("  ({:.2}% loss)", loss),
+                Style::default().fg(loss_color),
+            ),
+            Span::styled("  Underruns: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", stats.underruns),
+                Style::default().fg(underrun_color),
+            ),
+        ]));
+
+        // Show per-device RTX stats for group streaming
+        if !stats.devices.is_empty() {
+            // Get device names from group state
+            let device_names: Vec<&str> = if let Some(ref group) = state.group {
+                let mut names = vec![group.leader.name.as_str()];
+                for m in &group.members {
+                    if !m.is_leader {
+                        names.push(m.device.name.as_str());
+                    }
+                }
+                names
+            } else {
+                Vec::new()
+            };
+
+            for (i, dev) in stats.devices.iter().enumerate() {
+                if dev.rtx_requested == 0 && dev.rtx_fulfilled == 0 {
+                    continue;
+                }
+                let dev_loss = stats.device_loss_percent(i);
+                let dev_color = if dev_loss > 1.0 {
+                    Color::Red
+                } else if dev_loss > 0.1 {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                };
+                let name = device_names.get(i).copied().unwrap_or("??");
+                content.push(Line::from(vec![
+                    Span::styled(format!("  {}: ", name), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}/{}", dev.rtx_fulfilled, dev.rtx_requested),
+                        Style::default().fg(dev_color),
+                    ),
+                    Span::styled(
+                        format!("  ({:.2}%)", dev_loss),
+                        Style::default().fg(dev_color),
+                    ),
+                ]));
+            }
+        }
+    }
 
     let para = Paragraph::new(content)
         .block(Block::default().borders(Borders::ALL).title(" Now Playing "))

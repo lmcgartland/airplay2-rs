@@ -51,8 +51,16 @@ pub fn render_help(frame: &mut Frame, _state: &AppState) {
             Span::raw("Refresh device list"),
         ]),
         Line::from(vec![
+            Span::styled("  Space    ", Style::default().fg(Color::Green)),
+            Span::raw("Toggle device selection"),
+        ]),
+        Line::from(vec![
             Span::styled("  Enter    ", Style::default().fg(Color::Green)),
-            Span::raw("Connect to device"),
+            Span::raw("Connect (2+ selected = group)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  x        ", Style::default().fg(Color::Green)),
+            Span::raw("Disband group (when active)"),
         ]),
         Line::from(""),
         Line::from(Span::styled("File Browser", Style::default().fg(Color::Yellow))),
@@ -103,24 +111,6 @@ pub fn render_help(frame: &mut Frame, _state: &AppState) {
         Line::from(vec![
             Span::styled("  r        ", Style::default().fg(Color::Green)),
             Span::raw("Reset EQ to flat"),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled("Group View", Style::default().fg(Color::Yellow))),
-        Line::from(vec![
-            Span::styled("  g        ", Style::default().fg(Color::Green)),
-            Span::raw("Create / Open group"),
-        ]),
-        Line::from(vec![
-            Span::styled("  a        ", Style::default().fg(Color::Green)),
-            Span::raw("Add device to group"),
-        ]),
-        Line::from(vec![
-            Span::styled("  d        ", Style::default().fg(Color::Green)),
-            Span::raw("Remove from group"),
-        ]),
-        Line::from(vec![
-            Span::styled("  x        ", Style::default().fg(Color::Green)),
-            Span::raw("Disband group"),
         ]),
         Line::from(""),
         Line::from(Span::styled("General", Style::default().fg(Color::Yellow))),

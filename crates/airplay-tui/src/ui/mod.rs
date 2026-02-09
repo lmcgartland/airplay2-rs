@@ -3,7 +3,6 @@
 mod devices;
 mod browser;
 mod player;
-mod group;
 mod help;
 #[cfg(feature = "usb-audio")]
 mod usb_audio;
@@ -13,7 +12,6 @@ mod bluetooth;
 pub use devices::render_devices;
 pub use browser::render_browser;
 pub use player::render_player;
-pub use group::render_group;
 pub use help::render_help;
 #[cfg(feature = "usb-audio")]
 pub use usb_audio::render_usb_audio;
@@ -53,7 +51,6 @@ pub fn render(frame: &mut Frame, state: &AppState, browser: &FileBrowser) {
         View::Devices => render_devices(frame, chunks[1], state),
         View::Browser => render_browser(frame, chunks[1], browser),
         View::Player => render_player(frame, chunks[1], state),
-        View::Group => render_group(frame, chunks[1], state),
         #[cfg(feature = "usb-audio")]
         View::UsbAudio => render_usb_audio(frame, chunks[1], state),
         #[cfg(feature = "bluetooth")]
@@ -109,14 +106,22 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         // Show key hints based on current view
         let hints = match state.view {
-            View::Devices => "r: Refresh  Enter: Connect  Tab: Next view  ?: Help  q: Quit",
+            View::Devices => {
+                let selected = state.devices.iter().filter(|e| e.is_selected).count();
+                if state.group.is_some() {
+                    "r: Refresh  Space: Select  x: Disband  Enter: Connect  ?: Help  q: Quit"
+                } else if selected >= 2 {
+                    "r: Refresh  Space: Select  Enter: Connect group  ?: Help  q: Quit"
+                } else {
+                    "r: Refresh  Space: Select  Enter: Connect  ?: Help  q: Quit"
+                }
+            },
             View::Browser => "Enter: Select  Esc: Back  Tab: Next view  ?: Help",
             View::Player => "Space: Play/Pause  s: Stop  +/-: Volume  Tab: Next view",
-            View::Group => "a: Add  d: Remove  Enter: Select  Tab: Next view",
             #[cfg(feature = "usb-audio")]
             View::UsbAudio => "r: Refresh  Enter: Select  u: Start streaming  x: Stop",
             #[cfg(feature = "bluetooth")]
-            View::Bluetooth => "s: Scan  p: Pair  c: Connect  d: Disconnect  u: Use as source",
+            View::Bluetooth => "s: Scan  p: Pair  c: Connect  d: Disconnect  u: Source  o: Radio on/off",
         };
         Span::styled(hints, Style::default().fg(Color::DarkGray))
     };

@@ -11,6 +11,9 @@ use std::time::Duration;
 /// Marks packets with DSCP EF (Expedited Forwarding, 0xB8), which maps to
 /// WiFi WMM AC_VO (Voice) priority. This reduces packet loss on congested
 /// WiFi networks by giving audio packets higher priority than best-effort traffic.
+///
+/// Also enlarges the kernel send buffer (SO_SNDBUF) to 1MB to prevent drops
+/// when bursting packets to multiple group devices simultaneously.
 fn set_socket_qos(socket: &UdpSocket) {
     use std::os::unix::io::AsRawFd;
     let fd = socket.as_raw_fd();
@@ -28,6 +31,22 @@ fn set_socket_qos(socket: &UdpSocket) {
         );
         if ret != 0 {
             tracing::debug!("Failed to set IP_TOS (DSCP EF): errno={}", std::io::Error::last_os_error());
+        }
+    }
+
+    // Enlarge send buffer to 1MB. Default is often 128-212KB which can cause
+    // kernel-side drops when bursting to multiple group devices at once.
+    unsafe {
+        let buf_size: libc::c_int = 1024 * 1024; // 1MB
+        let ret = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &buf_size as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        if ret != 0 {
+            tracing::debug!("Failed to set SO_SNDBUF: errno={}", std::io::Error::last_os_error());
         }
     }
 

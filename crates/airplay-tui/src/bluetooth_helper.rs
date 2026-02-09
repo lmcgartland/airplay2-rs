@@ -318,6 +318,49 @@ pub async fn has_active_audio_stream(address: &str) -> bool {
     pcms.iter().any(|s| s.contains(&address_underscored))
 }
 
+/// Set Bluetooth adapter power state.
+pub async fn set_adapter_power(on: bool) -> Result<(), String> {
+    let state = if on { "on" } else { "off" };
+    info!("Setting Bluetooth adapter power {}", state);
+
+    let output = Command::new("bluetoothctl")
+        .args(["power", state])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("Failed to set adapter power: {}", e))?;
+
+    if output.status.success() {
+        info!("Bluetooth adapter power set to {}", state);
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("Failed to set power {}: {}", state, stderr))
+    }
+}
+
+/// Check if Bluetooth adapter is powered on.
+pub async fn is_adapter_powered() -> bool {
+    let output = Command::new("bluetoothctl")
+        .args(["show"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    match output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed.starts_with("Powered:") && trimmed.contains("yes")
+            })
+        }
+        Err(_) => false,
+    }
+}
+
 /// Get BlueALSA status summary.
 ///
 /// Returns info about the BlueALSA service and available PCMs.

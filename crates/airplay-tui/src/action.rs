@@ -65,8 +65,6 @@ pub enum Action {
     PlayFile(PathBuf),
 
     // Group actions
-    /// Open group view.
-    OpenGroup,
     /// Create group from connected device and selected devices.
     CreateGroup,
     /// Add selected device to group.
@@ -77,6 +75,14 @@ pub enum Action {
     DisbandGroup,
     /// Group changed.
     GroupChanged,
+    /// Toggle device selection for group (Space key in Devices view).
+    ToggleDeviceSelect,
+    /// Connect to all selected devices as a synchronized group.
+    ConnectGroup,
+    /// Group connection completed.
+    GroupConnected { device_count: usize },
+    /// Play file to all group devices simultaneously.
+    PlayFileToGroup(PathBuf),
 
     // File browser actions
     /// Navigate to directory.
@@ -156,6 +162,9 @@ pub enum Action {
     #[cfg(feature = "bluetooth")]
     /// Update streaming status.
     BluetoothStreamingStatus(bool),
+    #[cfg(feature = "bluetooth")]
+    /// Toggle Bluetooth adapter power on/off.
+    BluetoothTogglePower,
     #[cfg(feature = "bluetooth")]
     /// Bluetooth error occurred.
     BluetoothError(String),

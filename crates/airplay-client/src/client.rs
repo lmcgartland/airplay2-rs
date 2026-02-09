@@ -3,9 +3,11 @@
 use airplay_core::{Device, DeviceId, StreamConfig, error::Result};
 use airplay_core::error::{Error, RtspError, DiscoveryError};
 use airplay_discovery::{ServiceBrowser, Discovery};
-use airplay_audio::{AudioDecoder, LiveAudioDecoder, LiveFrameSender, LivePcmFrame, EqConfig, EqParams};
+use airplay_audio::{AudioDecoder, AlacEncoder, AudioStreamer, LiveAudioDecoder, LiveFrameSender, EqConfig, EqParams, RetransmitRequest};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::path::Path;
+use std::net::UdpSocket;
 use std::time::Duration;
 use crate::{Connection, DeviceGroup, PlaybackState, EventHandler, ClientEvent};
 
@@ -13,12 +15,20 @@ use crate::{Connection, DeviceGroup, PlaybackState, EventHandler, ClientEvent};
 pub struct AirPlayClient {
     browser: ServiceBrowser,
     connection: Option<Connection>,
+    /// Secondary connections for multi-speaker group streaming.
+    group_connections: Vec<Connection>,
     group: Option<DeviceGroup>,
     event_handler: Option<Box<dyn EventHandler>>,
     stream_config: StreamConfig,
     /// Render delay in ms added to NTP timestamps for extra retransmit headroom.
     /// Default: 200ms for reliable playback over WiFi.
     render_delay_ms: u32,
+    /// AudioStreamer for group streaming (shared across all group devices).
+    group_streamer: Option<AudioStreamer>,
+    /// Playback state for group streaming (tracked separately from primary connection).
+    group_playback_state: Option<PlaybackState>,
+    /// Stream statistics (shared across all streaming threads).
+    stream_stats: Arc<crate::stats::StreamStats>,
 }
 
 impl AirPlayClient {
@@ -27,10 +37,14 @@ impl AirPlayClient {
         Ok(Self {
             browser: ServiceBrowser::new()?,
             connection: None,
+            group_connections: Vec::new(),
             group: None,
             event_handler: None,
             stream_config: StreamConfig::default(),
             render_delay_ms: 200, // 200ms default for reliable playback over WiFi
+            group_streamer: None,
+            group_playback_state: None,
+            stream_stats: crate::stats::StreamStats::new(),
         })
     }
 
@@ -39,10 +53,14 @@ impl AirPlayClient {
         Ok(Self {
             browser: ServiceBrowser::new()?,
             connection: None,
+            group_connections: Vec::new(),
             group: None,
             event_handler,
             stream_config: config,
             render_delay_ms: 200, // 200ms default for reliable playback over WiFi
+            group_streamer: None,
+            group_playback_state: None,
+            stream_stats: crate::stats::StreamStats::new(),
         })
     }
 
@@ -132,8 +150,21 @@ impl AirPlayClient {
         Ok(())
     }
 
-    /// Disconnect from current device.
+    /// Disconnect from current device and any group connections.
     pub async fn disconnect(&mut self) -> Result<()> {
+        // Stop group streamer if running
+        if let Some(ref mut streamer) = self.group_streamer {
+            let _ = streamer.stop().await;
+        }
+        self.group_streamer = None;
+
+        // Disconnect group connections
+        for conn in &mut self.group_connections {
+            let _ = conn.disconnect().await;
+        }
+        self.group_connections.clear();
+        self.group_playback_state = None;
+
         if let Some(ref mut connection) = self.connection {
             connection.disconnect().await?;
         }
@@ -267,6 +298,14 @@ impl AirPlayClient {
 
         connection.pause().await?;
 
+        // Flush group connections too
+        for conn in &mut self.group_connections {
+            let _ = conn.send_flush(0, 0).await;
+        }
+
+        if self.group_playback_state.is_some() {
+            self.group_playback_state = Some(PlaybackState::Paused);
+        }
         self.emit_event(ClientEvent::PlaybackStateChanged(PlaybackState::Paused)).await;
 
         Ok(())
@@ -280,6 +319,14 @@ impl AirPlayClient {
 
         connection.resume().await?;
 
+        // Resume group connections too
+        for conn in &mut self.group_connections {
+            let _ = conn.send_record().await;
+        }
+
+        if self.group_playback_state.is_some() {
+            self.group_playback_state = Some(PlaybackState::Playing);
+        }
         self.emit_event(ClientEvent::PlaybackStateChanged(PlaybackState::Playing)).await;
 
         Ok(())
@@ -287,12 +334,24 @@ impl AirPlayClient {
 
     /// Stop playback.
     pub async fn stop(&mut self) -> Result<()> {
+        // Stop group streamer first
+        if let Some(ref mut streamer) = self.group_streamer {
+            let _ = streamer.stop().await;
+        }
+        self.group_streamer = None;
+
         let connection = self.connection.as_mut().ok_or_else(|| {
             Error::Rtsp(RtspError::NoSession)
         })?;
 
         connection.stop().await?;
 
+        // Flush group connections too
+        for conn in &mut self.group_connections {
+            let _ = conn.send_flush(0, 0).await;
+        }
+
+        self.group_playback_state = None;
         self.emit_event(ClientEvent::PlaybackStateChanged(PlaybackState::Stopped)).await;
 
         Ok(())
@@ -324,6 +383,11 @@ impl AirPlayClient {
 
         connection.set_volume(volume).await?;
 
+        // Set volume on group connections too
+        for conn in &mut self.group_connections {
+            let _ = conn.set_volume(volume).await;
+        }
+
         self.emit_event(ClientEvent::VolumeChanged(volume)).await;
 
         Ok(())
@@ -350,7 +414,14 @@ impl AirPlayClient {
             Error::Rtsp(RtspError::NoSession)
         })?;
 
-        connection.send_feedback().await
+        connection.send_feedback().await?;
+
+        // Also send feedback to group connections to prevent session timeouts
+        for conn in &mut self.group_connections {
+            let _ = conn.send_feedback().await;
+        }
+
+        Ok(())
     }
 
     /// Set up the equalizer with shared parameters.
@@ -390,6 +461,10 @@ impl AirPlayClient {
 
     /// Get current playback state.
     pub fn playback_state(&self) -> PlaybackState {
+        // Group playback state takes priority when set
+        if let Some(state) = self.group_playback_state {
+            return state;
+        }
         self.connection
             .as_ref()
             .map(|c| c.playback_state())
@@ -419,7 +494,377 @@ impl AirPlayClient {
         Ok(())
     }
 
-    // Multi-room methods
+    // Multi-speaker group streaming methods
+
+    /// Connect to multiple devices for synchronized group playback.
+    ///
+    /// The first device becomes the primary (runs PTP BMCA). All subsequent
+    /// devices are set up as secondary group members sharing the primary's clock.
+    /// SETPEERS is sent to all devices so they know about each other.
+    pub async fn connect_group(&mut self, devices: &[Device]) -> Result<()> {
+        if devices.len() < 2 {
+            return Err(Error::Discovery(DiscoveryError::NoDevicesFound));
+        }
+
+        // Disconnect any existing connections
+        self.disconnect().await?;
+
+        // Use PTP timing for group sync
+        let mut config = self.stream_config.clone();
+        config.timing_protocol = airplay_core::stream::TimingProtocol::Ptp;
+        config.ptp_mode = airplay_core::PtpMode::Master;
+
+        // Generate ALAC magic cookie if needed
+        if config.audio_format.codec == airplay_core::AudioCodec::Alac && config.asc.is_none() {
+            let temp_encoder = AlacEncoder::new(config.audio_format.clone())
+                .map_err(|e| Error::Streaming(airplay_core::error::StreamingError::Encoding(
+                    format!("Failed to create encoder for magic cookie: {}", e)
+                )))?;
+            config.asc = Some(temp_encoder.magic_cookie());
+        }
+
+        // Connect + pair all devices
+        let mut connections: Vec<Connection> = Vec::new();
+        for device in devices {
+            let conn = Connection::connect_auto(device.clone(), config.clone(), "3939").await?;
+            connections.push(conn);
+        }
+
+        // Collect peer addresses
+        let mut peer_addresses: Vec<String> = devices.iter()
+            .flat_map(|d| d.addresses.iter().find(|a| a.is_ipv4()).map(|a| a.to_string()))
+            .collect();
+        if let Some(local_addr) = connections[0].local_addr() {
+            peer_addresses.push(local_addr.ip().to_string());
+        }
+
+        // Setup primary (first device) with PTP BMCA
+        connections[0].setup().await?;
+        connections[0].set_render_delay_ms(self.render_delay_ms);
+        connections[0].send_setpeers(&peer_addresses).await?;
+
+        // Get PTP state from primary
+        let ptp_clock_id = connections[0].ptp_master_clock_id()
+            .ok_or_else(|| RtspError::SetupFailed("Primary has no PTP clock ID".into()))?;
+        let timing_offset = connections[0].timing_offset()
+            .ok_or_else(|| RtspError::SetupFailed("Primary has no timing offset".into()))?;
+        let timing_rx = connections[0].timing_rx()
+            .ok_or_else(|| RtspError::SetupFailed("Primary has no timing channel".into()))?;
+
+        // Setup secondary devices (no PTP)
+        for i in 1..connections.len() {
+            let rx_clone = timing_rx.clone();
+            connections[i].setup_for_group(ptp_clock_id, timing_offset, rx_clone).await?;
+            connections[i].set_render_delay_ms(self.render_delay_ms);
+            connections[i].send_setpeers(&peer_addresses).await?;
+        }
+
+        // Store primary as main connection, rest as group connections
+        let mut iter = connections.into_iter();
+        self.connection = iter.next();
+        self.group_connections = iter.collect();
+
+        // Create group metadata
+        let mut group = DeviceGroup::new(devices[0].clone());
+        for device in devices.iter().skip(1) {
+            group.add_member(device.clone())?;
+        }
+        self.group = Some(group);
+
+        self.emit_event(ClientEvent::Connected(devices[0].clone())).await;
+        self.emit_event(ClientEvent::GroupChanged).await;
+
+        Ok(())
+    }
+
+    /// Play an audio file to all group devices simultaneously.
+    ///
+    /// Requires `connect_group()` to have been called first. Uses the same
+    /// AudioStreamer as single-device playback, getting RT priority, burst
+    /// sending, precise timing, buffer management, EQ, and proper retransmit
+    /// handling for free.
+    pub async fn play_file_to_group(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        // Stop existing group streamer
+        if let Some(ref mut streamer) = self.group_streamer {
+            let _ = streamer.stop().await;
+        }
+        self.group_streamer = None;
+
+        // FLUSH all connections to reset sequence numbers.
+        // Do NOT send RECORD here — it was already sent during setup()/setup_for_group().
+        // Sending a duplicate RECORD causes 500 Internal Server Error on some devices.
+        if let Some(ref mut conn) = self.connection {
+            let _ = conn.send_flush(0, 0).await;
+        }
+        for conn in &mut self.group_connections {
+            let _ = conn.send_flush(0, 0).await;
+        }
+
+        // Build RTP senders for all connections
+        let mut senders = Vec::new();
+        let connection = self.connection.as_ref().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+        senders.push(connection.build_rtp_sender()?);
+        for conn in &self.group_connections {
+            senders.push(conn.build_rtp_sender()?);
+        }
+
+        let ptp_clock_id = connection.ptp_master_clock_id()
+            .ok_or_else(|| RtspError::SetupFailed("No PTP clock ID for group streaming".into()))?;
+
+        // Create streamer with multi-target senders
+        let mut streamer = AudioStreamer::new(self.stream_config.clone());
+        streamer.set_rtp_senders(senders).await;
+
+        // Configure timing
+        if let Some(offset) = connection.timing_offset() {
+            streamer.set_timing_offset(offset).await;
+        }
+        if let Some(rx) = connection.timing_rx() {
+            streamer.set_timing_updates(rx).await;
+        }
+        streamer.set_ptp_sync_mode(ptp_clock_id).await;
+        if self.render_delay_ms > 0 {
+            streamer.set_render_delay_ms(self.render_delay_ms).await;
+        }
+
+        // Set up EQ if configured on primary connection
+        if let Some(ref conn) = self.connection {
+            if let (Some(config), Some(params)) = (conn.eq_config(), conn.eq_params()) {
+                streamer.set_eq_params(config, params).await;
+            }
+        }
+
+        // Open audio file and start streaming
+        let decoder = AudioDecoder::open(path)?;
+        streamer.start(decoder).await?;
+
+        // Create per-device stream stats (1 primary + N group connections)
+        let device_count = 1 + self.group_connections.len();
+        self.stream_stats = crate::stats::StreamStats::with_device_count(device_count);
+
+        // Spawn control channel listener for retransmit handling (all devices)
+        self.spawn_group_control_listener(&streamer);
+
+        self.group_streamer = Some(streamer);
+        self.group_playback_state = Some(PlaybackState::Playing);
+        self.emit_event(ClientEvent::PlaybackStateChanged(PlaybackState::Playing)).await;
+
+        Ok(())
+    }
+
+    /// Start live audio streaming to all group devices simultaneously.
+    ///
+    /// Requires `connect_group()` to have been called first. Uses the same
+    /// AudioStreamer as single-device playback, getting all optimizations for free.
+    pub async fn start_live_streaming_to_group(&mut self, decoder: LiveAudioDecoder) -> Result<()> {
+        // Stop existing group streamer
+        if let Some(ref mut streamer) = self.group_streamer {
+            let _ = streamer.stop().await;
+        }
+        self.group_streamer = None;
+
+        // FLUSH all connections to reset sequence numbers.
+        // Do NOT send RECORD here — it was already sent during setup()/setup_for_group().
+        // Sending a duplicate RECORD causes 500 Internal Server Error on some devices.
+        if let Some(ref mut conn) = self.connection {
+            let _ = conn.send_flush(0, 0).await;
+        }
+        for conn in &mut self.group_connections {
+            let _ = conn.send_flush(0, 0).await;
+        }
+
+        // Build RTP senders for all connections
+        let mut senders = Vec::new();
+        let connection = self.connection.as_ref().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+        senders.push(connection.build_rtp_sender()?);
+        for conn in &self.group_connections {
+            senders.push(conn.build_rtp_sender()?);
+        }
+
+        let ptp_clock_id = connection.ptp_master_clock_id()
+            .ok_or_else(|| RtspError::SetupFailed("No PTP clock ID for group streaming".into()))?;
+
+        // Create streamer with multi-target senders
+        let mut streamer = AudioStreamer::new(self.stream_config.clone());
+        streamer.set_rtp_senders(senders).await;
+
+        // Configure timing
+        if let Some(offset) = connection.timing_offset() {
+            streamer.set_timing_offset(offset).await;
+        }
+        if let Some(rx) = connection.timing_rx() {
+            streamer.set_timing_updates(rx).await;
+        }
+        streamer.set_ptp_sync_mode(ptp_clock_id).await;
+        if self.render_delay_ms > 0 {
+            streamer.set_render_delay_ms(self.render_delay_ms).await;
+        }
+
+        // Set up EQ if configured on primary connection
+        if let Some(ref conn) = self.connection {
+            if let (Some(config), Some(params)) = (conn.eq_config(), conn.eq_params()) {
+                streamer.set_eq_params(config, params).await;
+            }
+        }
+
+        // Start live streaming
+        streamer.start_live(decoder).await?;
+
+        // Create per-device stream stats (1 primary + N group connections)
+        let device_count = 1 + self.group_connections.len();
+        self.stream_stats = crate::stats::StreamStats::with_device_count(device_count);
+
+        // Spawn control channel listener for retransmit handling (all devices)
+        self.spawn_group_control_listener(&streamer);
+
+        self.group_streamer = Some(streamer);
+        self.group_playback_state = Some(PlaybackState::Playing);
+        self.emit_event(ClientEvent::PlaybackStateChanged(PlaybackState::Playing)).await;
+
+        Ok(())
+    }
+
+    /// Spawn a single control channel listener thread that polls ALL device
+    /// control sockets in round-robin for retransmit requests (PT=85).
+    fn spawn_group_control_listener(&self, streamer: &AudioStreamer) {
+        let mut control_sockets: Vec<(usize, UdpSocket)> = Vec::new();
+
+        // Primary connection
+        if let Some(ref conn) = self.connection {
+            if let Some(sock) = conn.clone_control_socket_for_recv() {
+                control_sockets.push((0, sock));
+            }
+        }
+
+        // Group connections
+        for (i, conn) in self.group_connections.iter().enumerate() {
+            if let Some(sock) = conn.clone_control_socket_for_recv() {
+                control_sockets.push((i + 1, sock));
+            }
+        }
+
+        if control_sockets.is_empty() {
+            return;
+        }
+
+        let streamer_clone = streamer.clone();
+        let rt_handle = tokio::runtime::Handle::current();
+        let stats = Arc::clone(&self.stream_stats);
+
+        std::thread::Builder::new()
+            .name("group-ctrl".into())
+            .spawn(move || {
+                for (_, sock) in &control_sockets {
+                    sock.set_read_timeout(Some(Duration::from_millis(1))).ok();
+                }
+                let mut buf = [0u8; 2048];
+                tracing::debug!("Group control listener started ({} sockets)", control_sockets.len());
+
+                loop {
+                    for &(device_index, ref sock) in &control_sockets {
+                        match sock.recv_from(&mut buf) {
+                            Ok((len, _)) => {
+                                if len < 4 { continue; }
+                                let payload_type = buf[1] & 0x7F;
+                                if payload_type == 85 {
+                                    let request = if len == 8 {
+                                        let first_seq = u16::from_be_bytes([buf[4], buf[5]]);
+                                        let count = u16::from_be_bytes([buf[6], buf[7]]);
+                                        Some(RetransmitRequest { first_sequence: first_seq, count })
+                                    } else if len >= 12 {
+                                        RetransmitRequest::parse(&buf[..len]).ok()
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(req) = request {
+                                        // Update aggregate stats
+                                        stats.rtx_requested.fetch_add(req.count as u64, Ordering::Relaxed);
+                                        // Update per-device stats
+                                        if let Some(dev) = stats.device(device_index) {
+                                            dev.rtx_requested.fetch_add(req.count as u64, Ordering::Relaxed);
+                                        }
+                                        match rt_handle.block_on(
+                                            streamer_clone.handle_retransmit_for_target(device_index, &req)
+                                        ) {
+                                            Ok(fulfilled) => {
+                                                if fulfilled > 0 {
+                                                    stats.rtx_fulfilled.fetch_add(fulfilled as u64, Ordering::Relaxed);
+                                                    if let Some(dev) = stats.device(device_index) {
+                                                        dev.rtx_fulfilled.fetch_add(fulfilled as u64, Ordering::Relaxed);
+                                                    }
+                                                    tracing::debug!(
+                                                        "Group RTX[{}]: retransmitted {}/{} (seq {}..{})",
+                                                        device_index, fulfilled, req.count,
+                                                        req.first_sequence,
+                                                        req.first_sequence.wrapping_add(req.count.saturating_sub(1))
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("Group RTX[{}]: retransmit failed: {}", device_index, e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut => {}
+                            Err(_) => {
+                                // Socket closed — mark inactive but keep polling others
+                            }
+                        }
+                    }
+                }
+            })
+            .ok(); // Thread spawn failure is non-fatal
+    }
+
+    /// Check if group streaming is active.
+    pub fn is_group_connected(&self) -> bool {
+        !self.group_connections.is_empty()
+    }
+
+    /// Get the number of devices in the active group (including primary).
+    pub fn group_device_count(&self) -> usize {
+        if self.group_connections.is_empty() {
+            0
+        } else {
+            1 + self.group_connections.len()
+        }
+    }
+
+    /// Get the shared stream stats.
+    pub fn stream_stats(&self) -> Arc<crate::stats::StreamStats> {
+        Arc::clone(&self.stream_stats)
+    }
+
+    /// Get a snapshot of current stream statistics.
+    ///
+    /// For group streaming: uses client-level per-device stats + streamer packets_sent.
+    /// For single-device: uses connection-level stats + streamer packets_sent.
+    pub fn stats_snapshot(&self) -> crate::stats::StatsSnapshot {
+        if self.group_streamer.is_some() {
+            let mut snap = self.stream_stats.snapshot();
+            if let Some(ref streamer) = self.group_streamer {
+                snap.packets_sent = streamer.packets_sent();
+                snap.underruns = streamer.underruns();
+            }
+            snap
+        } else if let Some(ref conn) = self.connection {
+            let mut snap = conn.stream_stats().snapshot();
+            snap.packets_sent = conn.streamer_packets_sent();
+            snap.underruns = conn.streamer_underruns();
+            snap
+        } else {
+            crate::stats::StatsSnapshot::default()
+        }
+    }
+
+    // Multi-room methods (legacy metadata-only group management)
 
     /// Create a multi-room group.
     pub async fn create_group(&mut self, devices: &[&Device]) -> Result<()> {
