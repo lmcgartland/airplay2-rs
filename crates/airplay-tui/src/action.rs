@@ -169,6 +169,28 @@ pub enum Action {
     /// Bluetooth error occurred.
     BluetoothError(String),
 
+    // Spatial audio actions
+    /// Move selected speaker/listener up (+Y).
+    SpatialMoveUp,
+    /// Move selected speaker/listener down (-Y).
+    SpatialMoveDown,
+    /// Move selected speaker/listener left (-X).
+    SpatialMoveLeft,
+    /// Move selected speaker/listener right (+X).
+    SpatialMoveRight,
+    /// Select next speaker/listener.
+    SpatialSelectNext,
+    /// Select previous speaker/listener.
+    SpatialSelectPrev,
+    /// Toggle spatial processing on/off.
+    SpatialToggleEnabled,
+    /// Cycle spatial mode (StereoPan <-> Stft51).
+    SpatialCycleMode,
+    /// Reset layout to default semicircle.
+    SpatialResetLayout,
+    /// Toggle fine movement mode.
+    SpatialFineToggle,
+
     // USB Audio actions
     #[cfg(feature = "usb-audio")]
     /// Refresh USB audio input device list.

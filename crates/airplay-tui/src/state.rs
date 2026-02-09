@@ -1,7 +1,7 @@
 //! Application state management.
 
 use airplay_core::Device;
-use airplay_client::{PlaybackState, DeviceGroup, EqConfig, EqParams, StatsSnapshot};
+use airplay_client::{PlaybackState, DeviceGroup, EqConfig, EqParams, StatsSnapshot, SpatialParams, SpatialMode};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,8 @@ pub enum View {
     /// Bluetooth audio source (Linux only).
     #[cfg(feature = "bluetooth")]
     Bluetooth,
+    /// Spatial audio placement for multi-speaker groups.
+    Spatial,
 }
 
 impl View {
@@ -48,6 +50,7 @@ impl View {
             View::UsbAudio => "USB Audio",
             #[cfg(feature = "bluetooth")]
             View::Bluetooth => "Bluetooth",
+            View::Spatial => "Spatial",
         }
     }
 
@@ -59,6 +62,7 @@ impl View {
         views.push(View::UsbAudio);
         #[cfg(feature = "bluetooth")]
         views.push(View::Bluetooth);
+        views.push(View::Spatial);
         views
     }
 
@@ -164,6 +168,10 @@ pub struct AppState {
     // Bluetooth state (Linux only)
     #[cfg(feature = "bluetooth")]
     pub bluetooth: BluetoothState,
+
+    // Spatial audio state
+    /// Spatial audio placement state.
+    pub spatial: SpatialState,
 }
 
 /// Device group state for UI.
@@ -292,6 +300,184 @@ impl EqState {
 impl Default for EqState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Spatial audio state for UI.
+#[derive(Debug)]
+pub struct SpatialState {
+    /// Whether spatial processing is enabled.
+    pub enabled: bool,
+    /// Current spatial mode.
+    pub mode: SpatialMode,
+    /// Speaker entries with positions.
+    pub speakers: Vec<SpatialSpeakerEntry>,
+    /// Listener position in meters.
+    pub listener_pos: (f64, f64),
+    /// Listener facing angle in radians.
+    pub listener_facing: f64,
+    /// Currently selected index (0..N-1 = speakers, N = listener).
+    pub selected_index: usize,
+    /// Shared spatial params for the audio thread.
+    pub params: Option<Arc<SpatialParams>>,
+    /// Room width in meters.
+    pub room_width: f64,
+    /// Room height in meters.
+    pub room_height: f64,
+    /// Whether fine movement mode is active (Shift held).
+    pub fine_mode: bool,
+}
+
+/// Speaker entry for the spatial UI.
+#[derive(Debug, Clone)]
+pub struct SpatialSpeakerEntry {
+    pub device_id: String,
+    pub device_name: String,
+    pub position: (f64, f64),
+}
+
+impl SpatialState {
+    /// Create new spatial state with defaults.
+    pub fn new() -> Self {
+        Self {
+            enabled: false,
+            mode: SpatialMode::StereoPan,
+            speakers: Vec::new(),
+            listener_pos: (0.0, 0.0),
+            listener_facing: std::f64::consts::FRAC_PI_2, // facing +Y
+            selected_index: 0,
+            params: None,
+            room_width: 8.0,
+            room_height: 6.0,
+            fine_mode: false,
+        }
+    }
+
+    /// Total number of selectable items (speakers + listener).
+    pub fn item_count(&self) -> usize {
+        self.speakers.len() + 1
+    }
+
+    /// Whether the listener is currently selected.
+    pub fn is_listener_selected(&self) -> bool {
+        self.selected_index == self.speakers.len()
+    }
+
+    /// Get the movement step size in meters.
+    pub fn step_size(&self) -> f64 {
+        if self.fine_mode { 0.05 } else { 0.25 }
+    }
+
+    /// Select next item (cycles through speakers then listener).
+    pub fn select_next(&mut self) {
+        self.selected_index = (self.selected_index + 1) % self.item_count();
+    }
+
+    /// Select previous item.
+    pub fn select_prev(&mut self) {
+        if self.selected_index == 0 {
+            self.selected_index = self.item_count() - 1;
+        } else {
+            self.selected_index -= 1;
+        }
+    }
+
+    /// Move the selected item by the given delta.
+    pub fn move_selected(&mut self, dx: f64, dy: f64) {
+        if self.is_listener_selected() {
+            self.listener_pos.0 = (self.listener_pos.0 + dx).clamp(-self.room_width / 2.0, self.room_width / 2.0);
+            self.listener_pos.1 = (self.listener_pos.1 + dy).clamp(-self.room_height / 2.0, self.room_height / 2.0);
+            if let Some(ref params) = self.params {
+                params.set_listener(self.listener_pos.0, self.listener_pos.1, self.listener_facing);
+            }
+        } else if let Some(speaker) = self.speakers.get_mut(self.selected_index) {
+            speaker.position.0 = (speaker.position.0 + dx).clamp(-self.room_width / 2.0, self.room_width / 2.0);
+            speaker.position.1 = (speaker.position.1 + dy).clamp(-self.room_height / 2.0, self.room_height / 2.0);
+            if let Some(ref params) = self.params {
+                params.set_speaker_position(self.selected_index, speaker.position.0, speaker.position.1);
+            }
+        }
+    }
+
+    /// Toggle spatial enabled state.
+    pub fn toggle_enabled(&mut self) {
+        self.enabled = !self.enabled;
+        if let Some(ref params) = self.params {
+            params.toggle_enabled();
+        }
+    }
+
+    /// Cycle between spatial modes.
+    pub fn cycle_mode(&mut self) {
+        self.mode = match self.mode {
+            SpatialMode::StereoPan => SpatialMode::Stft51,
+            SpatialMode::Stft51 => SpatialMode::StereoPan,
+        };
+        if let Some(ref params) = self.params {
+            params.cycle_mode();
+        }
+    }
+
+    /// Reset layout to default semicircle arrangement.
+    pub fn reset_layout(&mut self) {
+        let n = self.speakers.len();
+        if n == 0 { return; }
+
+        self.listener_pos = (0.0, 0.0);
+        self.listener_facing = std::f64::consts::FRAC_PI_2;
+
+        let radius = 2.0;
+        for (i, speaker) in self.speakers.iter_mut().enumerate() {
+            let angle = if n == 1 {
+                std::f64::consts::FRAC_PI_2
+            } else {
+                // Spread from -90 to +90 degrees
+                let t = i as f64 / (n - 1) as f64;
+                std::f64::consts::PI * (0.25 + 0.5 * t) // 45° to 135°
+            };
+            speaker.position = (radius * angle.cos(), radius * angle.sin());
+        }
+
+        // Push positions to params
+        if let Some(ref params) = self.params {
+            params.set_listener(self.listener_pos.0, self.listener_pos.1, self.listener_facing);
+            for (i, speaker) in self.speakers.iter().enumerate() {
+                params.set_speaker_position(i, speaker.position.0, speaker.position.1);
+            }
+        }
+    }
+
+    /// Get distance from listener to selected speaker (if a speaker is selected).
+    pub fn selected_distance(&self) -> Option<f64> {
+        if self.is_listener_selected() { return None; }
+        self.speakers.get(self.selected_index).map(|s| {
+            let dx = s.position.0 - self.listener_pos.0;
+            let dy = s.position.1 - self.listener_pos.1;
+            (dx * dx + dy * dy).sqrt()
+        })
+    }
+}
+
+impl Default for SpatialState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for SpatialState {
+    fn clone(&self) -> Self {
+        Self {
+            enabled: self.enabled,
+            mode: self.mode,
+            speakers: self.speakers.clone(),
+            listener_pos: self.listener_pos,
+            listener_facing: self.listener_facing,
+            selected_index: self.selected_index,
+            params: self.params.as_ref().map(Arc::clone),
+            room_width: self.room_width,
+            room_height: self.room_height,
+            fine_mode: self.fine_mode,
+        }
     }
 }
 
@@ -501,6 +687,7 @@ impl Default for AppState {
             usb_audio: UsbAudioState::default(),
             #[cfg(feature = "bluetooth")]
             bluetooth: BluetoothState::default(),
+            spatial: SpatialState::default(),
         }
     }
 }

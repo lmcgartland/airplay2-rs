@@ -3,7 +3,7 @@
 use airplay_core::{Device, DeviceId, StreamConfig, error::Result};
 use airplay_core::error::{Error, RtspError, DiscoveryError};
 use airplay_discovery::{ServiceBrowser, Discovery};
-use airplay_audio::{AudioDecoder, AlacEncoder, AudioStreamer, LiveAudioDecoder, LiveFrameSender, EqConfig, EqParams, RetransmitRequest};
+use airplay_audio::{AudioDecoder, AlacEncoder, AudioStreamer, LiveAudioDecoder, LiveFrameSender, EqConfig, EqParams, RetransmitRequest, SpatialParams, SpeakerConfig};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::path::Path;
@@ -29,6 +29,10 @@ pub struct AirPlayClient {
     group_playback_state: Option<PlaybackState>,
     /// Stream statistics (shared across all streaming threads).
     stream_stats: Arc<crate::stats::StreamStats>,
+    /// Stop flag for group control listener thread.
+    group_control_stop: Arc<std::sync::atomic::AtomicBool>,
+    /// Handle for group control listener thread (for cleanup).
+    group_control_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AirPlayClient {
@@ -45,6 +49,8 @@ impl AirPlayClient {
             group_streamer: None,
             group_playback_state: None,
             stream_stats: crate::stats::StreamStats::new(),
+            group_control_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            group_control_thread: None,
         })
     }
 
@@ -61,6 +67,8 @@ impl AirPlayClient {
             group_streamer: None,
             group_playback_state: None,
             stream_stats: crate::stats::StreamStats::new(),
+            group_control_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            group_control_thread: None,
         })
     }
 
@@ -150,15 +158,30 @@ impl AirPlayClient {
         Ok(())
     }
 
+    /// Stop the group control listener thread if running.
+    fn stop_group_control_listener(&mut self) {
+        self.group_control_stop.store(true, Ordering::Release);
+        if let Some(handle) = self.group_control_thread.take() {
+            // Thread polls with 1ms timeout, should exit within a few ms
+            match handle.join() {
+                Ok(()) => tracing::debug!("Group control listener thread joined"),
+                Err(_) => tracing::warn!("Group control listener thread panicked"),
+            }
+        }
+    }
+
     /// Disconnect from current device and any group connections.
     pub async fn disconnect(&mut self) -> Result<()> {
+        // Stop group control listener first (before closing sockets it reads from)
+        self.stop_group_control_listener();
+
         // Stop group streamer if running
         if let Some(ref mut streamer) = self.group_streamer {
             let _ = streamer.stop().await;
         }
         self.group_streamer = None;
 
-        // Disconnect group connections
+        // Disconnect group connections (sends TEARDOWN to each)
         for conn in &mut self.group_connections {
             let _ = conn.disconnect().await;
         }
@@ -334,7 +357,10 @@ impl AirPlayClient {
 
     /// Stop playback.
     pub async fn stop(&mut self) -> Result<()> {
-        // Stop group streamer first
+        // Stop group control listener (before streamer, to avoid stale thread reading sockets)
+        self.stop_group_control_listener();
+
+        // Stop group streamer
         if let Some(ref mut streamer) = self.group_streamer {
             let _ = streamer.stop().await;
         }
@@ -459,6 +485,28 @@ impl AirPlayClient {
         self.connection.as_ref().and_then(|c| c.eq_params())
     }
 
+    /// Set up spatial audio processing with shared parameters.
+    ///
+    /// When enabled, each speaker in the group receives a unique audio mix
+    /// based on its position relative to the listener. Parameters can be
+    /// updated atomically from another thread (e.g., the TUI).
+    ///
+    /// Must be called after `connect_group()` and before `play_file_to_group()`
+    /// or `start_live_streaming_to_group()`.
+    pub fn set_spatial_params(&mut self, params: Arc<SpatialParams>, speakers: Vec<SpeakerConfig>) -> Result<()> {
+        let connection = self.connection.as_mut().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+
+        connection.set_spatial_params(params, speakers);
+        Ok(())
+    }
+
+    /// Get a clone of the spatial params Arc if set.
+    pub fn spatial_params(&self) -> Option<Arc<SpatialParams>> {
+        self.connection.as_ref().and_then(|c| c.spatial_params())
+    }
+
     /// Get current playback state.
     pub fn playback_state(&self) -> PlaybackState {
         // Group playback state takes priority when set
@@ -551,8 +599,16 @@ impl AirPlayClient {
         let timing_rx = connections[0].timing_rx()
             .ok_or_else(|| RtspError::SetupFailed("Primary has no timing channel".into()))?;
 
-        // Setup secondary devices (no PTP)
+        // Setup secondary devices (no PTP).
+        // Send feedback to already-established connections between each setup to
+        // prevent RTSP session timeouts (connect_group holds the client lock for
+        // the entire duration, blocking the tick handler from sending keepalives).
         for i in 1..connections.len() {
+            // Keep earlier connections alive while setting up later ones
+            for j in 0..i {
+                let _ = connections[j].send_feedback().await;
+            }
+
             let rx_clone = timing_rx.clone();
             connections[i].setup_for_group(ptp_clock_id, timing_offset, rx_clone).await?;
             connections[i].set_render_delay_ms(self.render_delay_ms);
@@ -584,23 +640,15 @@ impl AirPlayClient {
     /// sending, precise timing, buffer management, EQ, and proper retransmit
     /// handling for free.
     pub async fn play_file_to_group(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        // Stop existing group streamer
+        // Stop existing group control listener and streamer cleanly
+        self.stop_group_control_listener();
         if let Some(ref mut streamer) = self.group_streamer {
             let _ = streamer.stop().await;
         }
         self.group_streamer = None;
 
-        // FLUSH all connections to reset sequence numbers.
-        // Do NOT send RECORD here — it was already sent during setup()/setup_for_group().
-        // Sending a duplicate RECORD causes 500 Internal Server Error on some devices.
-        if let Some(ref mut conn) = self.connection {
-            let _ = conn.send_flush(0, 0).await;
-        }
-        for conn in &mut self.group_connections {
-            let _ = conn.send_flush(0, 0).await;
-        }
-
-        // Build RTP senders for all connections
+        // Build RTP senders for all connections FIRST (before FLUSH/RECORD).
+        // Matches solo path ordering to minimize gap between FLUSH and first audio.
         let mut senders = Vec::new();
         let connection = self.connection.as_ref().ok_or_else(|| {
             Error::Rtsp(RtspError::NoSession)
@@ -636,9 +684,57 @@ impl AirPlayClient {
             }
         }
 
+        // Set up spatial audio if configured on primary connection
+        if let Some(ref conn) = self.connection {
+            if let (Some(params), Some(speakers)) = (conn.spatial_params(), conn.spatial_speakers()) {
+                streamer.set_spatial_params(params, speakers).await;
+            }
+        }
+
+        // NOW send FLUSH + RECORD, right before start. Minimizes the gap between
+        // "device resets state" and "first audio packet arrives".
+        if let Some(ref mut conn) = self.connection {
+            if let Err(e) = conn.send_flush(0, 0).await {
+                tracing::warn!("FLUSH failed on primary: {}", e);
+            }
+        }
+        for (i, conn) in self.group_connections.iter_mut().enumerate() {
+            if let Err(e) = conn.send_flush(0, 0).await {
+                tracing::warn!("FLUSH failed on group member {}: {}", i, e);
+            }
+        }
+        if let Some(ref mut conn) = self.connection {
+            if let Err(e) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                conn.send_record(),
+            ).await {
+                tracing::warn!("RECORD timeout on primary: {}", e);
+            }
+        }
+        for (i, conn) in self.group_connections.iter_mut().enumerate() {
+            if let Err(e) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                conn.send_record(),
+            ).await {
+                tracing::warn!("RECORD timeout on group member {}: {}", i, e);
+            }
+        }
+
         // Open audio file and start streaming
         let decoder = AudioDecoder::open(path)?;
         streamer.start(decoder).await?;
+
+        // Set volume on all devices (matches solo path behavior)
+        if let Some(ref mut conn) = self.connection {
+            if let Err(e) = conn.set_volume(conn.volume()).await {
+                tracing::warn!("Failed to set volume on primary: {}", e);
+            }
+        }
+        for conn in &mut self.group_connections {
+            if let Err(e) = conn.set_volume(conn.volume()).await {
+                tracing::warn!("Failed to set volume on group member: {}", e);
+            }
+        }
 
         // Create per-device stream stats (1 primary + N group connections)
         let device_count = 1 + self.group_connections.len();
@@ -659,23 +755,17 @@ impl AirPlayClient {
     /// Requires `connect_group()` to have been called first. Uses the same
     /// AudioStreamer as single-device playback, getting all optimizations for free.
     pub async fn start_live_streaming_to_group(&mut self, decoder: LiveAudioDecoder) -> Result<()> {
-        // Stop existing group streamer
+        // Stop existing group control listener and streamer cleanly
+        self.stop_group_control_listener();
         if let Some(ref mut streamer) = self.group_streamer {
             let _ = streamer.stop().await;
         }
         self.group_streamer = None;
 
-        // FLUSH all connections to reset sequence numbers.
-        // Do NOT send RECORD here — it was already sent during setup()/setup_for_group().
-        // Sending a duplicate RECORD causes 500 Internal Server Error on some devices.
-        if let Some(ref mut conn) = self.connection {
-            let _ = conn.send_flush(0, 0).await;
-        }
-        for conn in &mut self.group_connections {
-            let _ = conn.send_flush(0, 0).await;
-        }
-
-        // Build RTP senders for all connections
+        // Build RTP senders for all connections FIRST (before FLUSH/RECORD).
+        // This matches the solo path ordering: build infrastructure → FLUSH → start_live.
+        // Minimizes the gap between FLUSH/RECORD and first audio packet, which is
+        // critical because devices start a timeout after receiving FLUSH+RECORD.
         let mut senders = Vec::new();
         let connection = self.connection.as_ref().ok_or_else(|| {
             Error::Rtsp(RtspError::NoSession)
@@ -711,8 +801,59 @@ impl AirPlayClient {
             }
         }
 
-        // Start live streaming
+        // Set up spatial audio if configured on primary connection
+        if let Some(ref conn) = self.connection {
+            if let (Some(params), Some(speakers)) = (conn.spatial_params(), conn.spatial_speakers()) {
+                streamer.set_spatial_params(params, speakers).await;
+            }
+        }
+
+        // NOW send FLUSH + RECORD, right before start_live. This minimizes the
+        // window between "device resets state" and "first audio packet arrives".
+        // RECORD re-arms devices that may have timed out since connect_group().
+        if let Some(ref mut conn) = self.connection {
+            if let Err(e) = conn.send_flush(0, 0).await {
+                tracing::warn!("FLUSH failed on primary: {}", e);
+            }
+        }
+        for (i, conn) in self.group_connections.iter_mut().enumerate() {
+            if let Err(e) = conn.send_flush(0, 0).await {
+                tracing::warn!("FLUSH failed on group member {}: {}", i, e);
+            }
+        }
+        if let Some(ref mut conn) = self.connection {
+            if let Err(e) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                conn.send_record(),
+            ).await {
+                tracing::warn!("RECORD timeout on primary: {}", e);
+            }
+        }
+        for (i, conn) in self.group_connections.iter_mut().enumerate() {
+            if let Err(e) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                conn.send_record(),
+            ).await {
+                tracing::warn!("RECORD timeout on group member {}: {}", i, e);
+            }
+        }
+
+        // Start live streaming — buffer fill + sender thread.
+        // Audio begins flowing immediately after buffer reaches 50%.
         streamer.start_live(decoder).await?;
+
+        // Set volume on all devices (solo path does this; without it, devices
+        // may use stale volume or silence after FLUSH)
+        if let Some(ref mut conn) = self.connection {
+            if let Err(e) = conn.set_volume(conn.volume()).await {
+                tracing::warn!("Failed to set volume on primary: {}", e);
+            }
+        }
+        for conn in &mut self.group_connections {
+            if let Err(e) = conn.set_volume(conn.volume()).await {
+                tracing::warn!("Failed to set volume on group member: {}", e);
+            }
+        }
 
         // Create per-device stream stats (1 primary + N group connections)
         let device_count = 1 + self.group_connections.len();
@@ -730,7 +871,10 @@ impl AirPlayClient {
 
     /// Spawn a single control channel listener thread that polls ALL device
     /// control sockets in round-robin for retransmit requests (PT=85).
-    fn spawn_group_control_listener(&self, streamer: &AudioStreamer) {
+    fn spawn_group_control_listener(&mut self, streamer: &AudioStreamer) {
+        // Kill any existing group control listener first
+        self.stop_group_control_listener();
+
         let mut control_sockets: Vec<(usize, UdpSocket)> = Vec::new();
 
         // Primary connection
@@ -754,17 +898,24 @@ impl AirPlayClient {
         let streamer_clone = streamer.clone();
         let rt_handle = tokio::runtime::Handle::current();
         let stats = Arc::clone(&self.stream_stats);
+        let stop_flag = Arc::clone(&self.group_control_stop);
+        stop_flag.store(false, Ordering::Release);
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("group-ctrl".into())
             .spawn(move || {
                 for (_, sock) in &control_sockets {
-                    sock.set_read_timeout(Some(Duration::from_millis(1))).ok();
+                    sock.set_read_timeout(Some(Duration::from_millis(5))).ok();
                 }
                 let mut buf = [0u8; 2048];
                 tracing::debug!("Group control listener started ({} sockets)", control_sockets.len());
 
                 loop {
+                    if stop_flag.load(Ordering::Acquire) {
+                        tracing::info!("Group control listener: stop flag set, exiting");
+                        break;
+                    }
+
                     for &(device_index, ref sock) in &control_sockets {
                         match sock.recv_from(&mut buf) {
                             Ok((len, _)) => {
@@ -781,9 +932,7 @@ impl AirPlayClient {
                                         None
                                     };
                                     if let Some(req) = request {
-                                        // Update aggregate stats
                                         stats.rtx_requested.fetch_add(req.count as u64, Ordering::Relaxed);
-                                        // Update per-device stats
                                         if let Some(dev) = stats.device(device_index) {
                                             dev.rtx_requested.fetch_add(req.count as u64, Ordering::Relaxed);
                                         }
@@ -819,8 +968,16 @@ impl AirPlayClient {
                         }
                     }
                 }
-            })
-            .ok(); // Thread spawn failure is non-fatal
+            });
+
+        match handle {
+            Ok(h) => {
+                self.group_control_thread = Some(h);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to spawn group control listener: {}", e);
+            }
+        }
     }
 
     /// Check if group streaming is active.

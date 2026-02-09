@@ -4,6 +4,7 @@ use airplay_core::{StreamConfig, error::Result};
 use crate::{AudioBuffer, AudioDecoder, RtpSender, LiveAudioDecoder};
 use crate::encoder::{create_encoder, AudioEncoder};
 use crate::eq::{EqConfig, EqParams, Equalizer};
+use crate::spatial::{SpatialMixer, SpatialParams, SpatialSnapshot, SpeakerConfig, Position};
 use airplay_timing::{Clock, ClockOffset, unix_to_ntp};
 use std::sync::{Arc, atomic::{AtomicU64, AtomicU8, Ordering}};
 use tokio::sync::{Mutex, watch};
@@ -386,6 +387,14 @@ struct StreamerInner {
     encoder: Option<Box<dyn AudioEncoder>>,
     /// Audio equalizer for processing audio before encoding.
     equalizer: Option<Equalizer>,
+    /// Spatial mixer for per-speaker audio processing.
+    spatial_mixer: Option<SpatialMixer>,
+    /// Shared spatial parameters (atomic, updated from UI).
+    spatial_params: Option<Arc<SpatialParams>>,
+    /// Per-speaker ALAC encoders (one per speaker when spatial is active).
+    spatial_encoders: Vec<Box<dyn AudioEncoder>>,
+    /// Cached spatial snapshot to detect parameter changes.
+    spatial_snapshot: Option<SpatialSnapshot>,
     /// Track whether first audio packet has been sent (requires marker bit)
     first_packet_sent: bool,
     /// Render delay in nanoseconds added to NTP timestamps in sync packets.
@@ -448,6 +457,10 @@ impl AudioStreamer {
                 live_decoder: None,
                 encoder: None,
                 equalizer: None,
+                spatial_mixer: None,
+                spatial_params: None,
+                spatial_encoders: Vec::new(),
+                spatial_snapshot: None,
                 first_packet_sent: false,
                 render_delay_ns: 0,
                 use_ptp_sync: false,
@@ -507,6 +520,41 @@ impl AudioStreamer {
         let sample_rate = inner.config.audio_format.sample_rate.as_hz();
         inner.equalizer = Some(Equalizer::new(config, params, sample_rate));
         tracing::info!("Equalizer enabled with {} bands", inner.equalizer.as_ref().unwrap().config().num_bands());
+    }
+
+    /// Set up spatial audio processing with shared parameters.
+    ///
+    /// Creates a SpatialMixer with per-speaker encoders. The params can be
+    /// updated atomically from the UI thread. Speaker configs must match
+    /// the rtp_senders order.
+    pub async fn set_spatial_params(
+        &mut self,
+        params: Arc<SpatialParams>,
+        speaker_configs: Vec<SpeakerConfig>,
+    ) {
+        let mut inner = self.inner.lock().await;
+        let sample_rate = inner.config.audio_format.sample_rate.as_hz() as f64;
+        let num_speakers = speaker_configs.len();
+
+        let mixer = SpatialMixer::new(speaker_configs, sample_rate);
+
+        // Create per-speaker encoders (one ALAC encoder per speaker)
+        let mut encoders: Vec<Box<dyn AudioEncoder>> = Vec::with_capacity(num_speakers);
+        for _ in 0..num_speakers {
+            match create_encoder(inner.config.audio_format.clone()) {
+                Ok(enc) => encoders.push(enc),
+                Err(e) => {
+                    tracing::error!("Failed to create spatial encoder: {}", e);
+                    return;
+                }
+            }
+        }
+
+        tracing::info!("Spatial audio enabled with {} speakers", num_speakers);
+        inner.spatial_mixer = Some(mixer);
+        inner.spatial_params = Some(params);
+        inner.spatial_encoders = encoders;
+        inner.spatial_snapshot = None;
     }
 
     /// Get a clone of the EQ params if the equalizer is set up.
@@ -839,10 +887,14 @@ impl AudioStreamer {
         self.sender_tx = None;
 
         // Now safe to join — sender thread will exit from channel disconnect.
+        // Use a timeout to prevent hanging if the thread is stuck in I/O.
         if let Some(handle) = self.sender_thread.take() {
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = handle.join();
-            }).await;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::task::spawn_blocking(move || {
+                    let _ = handle.join();
+                }),
+            ).await;
         }
 
         // Cancel the run_streamer task if still running
@@ -1069,24 +1121,88 @@ async fn run_streamer(
                     (*frame.samples).clone()
                 };
 
-                // Encode synchronously
+                // Check if spatial processing is enabled and active
+                let spatial_enabled = guard.spatial_params.as_ref()
+                    .map_or(false, |p| p.is_enabled())
+                    && guard.spatial_mixer.is_some()
+                    && !guard.spatial_encoders.is_empty();
+
+                // Encode: either per-speaker (spatial) or single shared (bypass)
                 let encode_start = Instant::now();
-                let encoder = guard
-                    .encoder
-                    .as_mut()
-                    .ok_or_else(|| airplay_core::error::StreamingError::Encoding("Encoder missing".into()))?;
-                let packet = encoder.encode(&samples_to_encode)?;
+
+                // Per-speaker ALAC data (populated only when spatial is active)
+                let mut per_speaker_alac: Vec<Vec<u8>> = Vec::new();
+                // Shared ALAC data (populated when spatial is bypassed)
+                let mut shared_alac: Option<Vec<u8>> = None;
+
+                // Use the streamer's own monotonic timestamp counter instead of
+                // the encoder's internal counter. This prevents RTP timestamp
+                // discontinuities when toggling between spatial and bypass paths
+                // (each encoder tracks its own timestamp independently).
+                let packet_timestamp = guard.current_timestamp;
+                let frames_per_packet = guard.config.audio_format.frames_per_packet as usize;
+
+                if spatial_enabled {
+                    // --- Spatial path: per-speaker encoding ---
+                    // Update spatial mixer from atomic params
+                    let snap = guard.spatial_params.as_ref().unwrap().snapshot();
+                    let mode = snap.mode;
+                    if let Some(ref mut mixer) = guard.spatial_mixer {
+                        mixer.update_from_snapshot(&snap);
+
+                        // Convert i16 stereo to f64 interleaved
+                        let stereo_f64: Vec<f64> = samples_to_encode.iter()
+                            .map(|&s| s as f64 / 32768.0)
+                            .collect();
+
+                        // Process through spatial mixer → per-speaker mono buffers
+                        let speaker_buffers = mixer.process_buffer(&stereo_f64, mode);
+
+                        // Encode each speaker's mono buffer as stereo (L=R)
+                        for (spk_idx, mono_buf) in speaker_buffers.iter().enumerate() {
+                            if spk_idx >= guard.spatial_encoders.len() {
+                                break;
+                            }
+                            // Convert mono f64 → stereo i16 (duplicate L=R)
+                            let mut stereo_i16 = Vec::with_capacity(mono_buf.len() * 2);
+                            for &sample in mono_buf {
+                                let s = (sample * 32767.0).round().clamp(-32768.0, 32767.0) as i16;
+                                stereo_i16.push(s);
+                                stereo_i16.push(s);
+                            }
+                            let pkt = guard.spatial_encoders[spk_idx].encode(&stereo_i16)?;
+                            per_speaker_alac.push(pkt.data);
+                        }
+                    }
+                } else {
+                    // --- Bypass path: single encode, same ALAC to all ---
+                    let encoder = guard
+                        .encoder
+                        .as_mut()
+                        .ok_or_else(|| airplay_core::error::StreamingError::Encoding("Encoder missing".into()))?;
+                    let packet = encoder.encode(&samples_to_encode)?;
+                    shared_alac = Some(packet.data);
+                }
+
                 let encode_elapsed = encode_start.elapsed();
 
-                // Diagnostic: log encoded ALAC data and timing for first few packets
+                // Diagnostic: log encoding timing
                 if diag < 5 || diag % 500 == 0 {
-                    let all_zero = packet.data.iter().all(|&b| b == 0);
-                    tracing::info!(
-                        "DIAG ALAC packet #{}: encoded_len={}, all_zero={}, first_8={:02x?}, encode_time={:.2}ms",
-                        diag, packet.data.len(), all_zero,
-                        &packet.data[..packet.data.len().min(8)],
-                        encode_elapsed.as_secs_f64() * 1000.0
-                    );
+                    if spatial_enabled {
+                        tracing::info!(
+                            "DIAG spatial encode #{}: {} speakers, encode_time={:.2}ms",
+                            diag, per_speaker_alac.len(),
+                            encode_elapsed.as_secs_f64() * 1000.0
+                        );
+                    } else if let Some(ref alac) = shared_alac {
+                        let all_zero = alac.iter().all(|&b| b == 0);
+                        tracing::info!(
+                            "DIAG ALAC packet #{}: encoded_len={}, all_zero={}, first_8={:02x?}, encode_time={:.2}ms",
+                            diag, alac.len(), all_zero,
+                            &alac[..alac.len().min(8)],
+                            encode_elapsed.as_secs_f64() * 1000.0
+                        );
+                    }
                 }
 
                 let payload_type = guard.config.stream_type as u8;
@@ -1114,33 +1230,29 @@ async fn run_streamer(
                     local_wall
                 };
 
-                // Apply render delay: shift NTP timestamp into the future so the
-                // receiver buffers audio longer before rendering, giving more
-                // time for retransmit recovery of lost packets.
+                // Apply render delay
                 let render_adjusted = adjusted + guard.render_delay_ns;
                 let ntp = unix_to_ntp(render_adjusted);
 
-                // Set marker bit on first audio packet (required by some receivers)
+                // Set marker bit on first audio packet
                 let first_packet = !guard.first_packet_sent;
                 let marker = first_packet;
                 if marker {
                     tracing::info!("Sending first audio packet with marker bit set");
                 }
 
-                let rtp_ts = packet.timestamp as u32;
+                let rtp_ts = packet_timestamp as u32;
 
-                // Determine if sync is needed BEFORE borrowing rtp_sender
+                // Determine if sync is needed
                 let need_sync = first_packet || last_sync_rtp == 0
                     || rtp_ts.wrapping_sub(last_sync_rtp) >= sample_rate;
 
-                // Extract PTP sync mode state before borrowing rtp_sender
                 let use_ptp_sync = guard.use_ptp_sync;
                 let ptp_clock_id = guard.ptp_master_clock_id;
 
                 if !guard.rtp_senders.is_empty() {
                     if let Some(ref tx) = sender_tx {
-                        // Sender thread path: prepare sync from first sender (shared),
-                        // then prepare audio from ALL senders (per-device encryption).
+                        // Sender thread path
                         let sync_data = if need_sync {
                             if use_ptp_sync {
                                 let next_rtp_ts = rtp_ts.wrapping_add(sample_rate / 44100 * 352);
@@ -1153,8 +1265,19 @@ async fn run_streamer(
                         };
 
                         let mut wire_packets = Vec::with_capacity(guard.rtp_senders.len());
-                        for sender in &mut guard.rtp_senders {
-                            wire_packets.push(sender.prepare_audio(payload_type, rtp_ts, &packet.data, marker)?);
+                        if spatial_enabled && !per_speaker_alac.is_empty() {
+                            // Spatial: each speaker gets its own ALAC data
+                            for (i, sender) in guard.rtp_senders.iter_mut().enumerate() {
+                                let alac_data = per_speaker_alac.get(i)
+                                    .map(|d| d.as_slice())
+                                    .unwrap_or_else(|| per_speaker_alac.last().unwrap());
+                                wire_packets.push(sender.prepare_audio(payload_type, rtp_ts, alac_data, marker)?);
+                            }
+                        } else if let Some(ref alac) = shared_alac {
+                            // Bypass: same ALAC to all
+                            for sender in &mut guard.rtp_senders {
+                                wire_packets.push(sender.prepare_audio(payload_type, rtp_ts, alac, marker)?);
+                            }
                         }
 
                         if diag < 5 || diag % 500 == 0 {
@@ -1173,7 +1296,7 @@ async fn run_streamer(
                         if first_packet {
                             guard.first_packet_sent = true;
                         }
-                        guard.current_timestamp = packet.timestamp + packet.samples as u64;
+                        guard.current_timestamp = packet_timestamp + frames_per_packet as u64;
                         timestamp_cache.store(guard.current_timestamp, Ordering::Relaxed);
                         packets_sent_counter.fetch_add(1, Ordering::Relaxed);
 
@@ -1206,8 +1329,17 @@ async fn run_streamer(
                         }
 
                         let send_start = Instant::now();
-                        for sender in &mut guard.rtp_senders {
-                            sender.send_audio(payload_type, rtp_ts, &packet.data, marker)?;
+                        if spatial_enabled && !per_speaker_alac.is_empty() {
+                            for (i, sender) in guard.rtp_senders.iter_mut().enumerate() {
+                                let alac_data = per_speaker_alac.get(i)
+                                    .map(|d| d.as_slice())
+                                    .unwrap_or_else(|| per_speaker_alac.last().unwrap());
+                                sender.send_audio(payload_type, rtp_ts, alac_data, marker)?;
+                            }
+                        } else if let Some(ref alac) = shared_alac {
+                            for sender in &mut guard.rtp_senders {
+                                sender.send_audio(payload_type, rtp_ts, alac, marker)?;
+                            }
                         }
                         let send_elapsed = send_start.elapsed();
 
@@ -1228,7 +1360,7 @@ async fn run_streamer(
                         if first_packet {
                             guard.first_packet_sent = true;
                         }
-                        guard.current_timestamp = packet.timestamp + packet.samples as u64;
+                        guard.current_timestamp = packet_timestamp + frames_per_packet as u64;
                         timestamp_cache.store(guard.current_timestamp, Ordering::Relaxed);
                         packets_sent_counter.fetch_add(1, Ordering::Relaxed);
                     }

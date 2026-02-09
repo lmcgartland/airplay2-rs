@@ -26,6 +26,7 @@ fdk-aac.workspace = true
 
 # Audio processing
 biquad = "0.4"
+rustfft = "6"
 
 [dev-dependencies]
 tokio-test.workspace = true
