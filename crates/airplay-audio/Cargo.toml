@@ -2,6 +2,8 @@
 name = "airplay-audio"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Audio encoding and RTP streaming for AirPlay 2"
 
 [dependencies]

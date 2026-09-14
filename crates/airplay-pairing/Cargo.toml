@@ -2,6 +2,8 @@
 name = "airplay-pairing"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "HomeKit and FairPlay authentication for AirPlay 2"
 
 [dependencies]

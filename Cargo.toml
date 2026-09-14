@@ -17,8 +17,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "GPL-2.0"
-repository = "https://github.com/example/airplay2-sender"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/lmcgartland/airplay2-rs"
 
 [workspace.dependencies]
 # Async runtime
