@@ -14,7 +14,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn, error, instrument};
 
-use airplay_client::{AirPlayClient, PlaybackState, ClientEvent, CallbackHandler, EqConfig};
+use airplay_client::{AirPlayClient, PlaybackState, ClientEvent, CallbackHandler, SpatialParams, SpatialMode, SpeakerConfig, Position};
 #[cfg(any(all(feature = "bluetooth", target_os = "linux"), feature = "usb-audio"))]
 use airplay_client::{LiveFrameSender, LivePcmFrame};
 use airplay_core::{Device, StreamConfig};
@@ -23,7 +23,7 @@ use crate::action::Action;
 use crate::audio_info;
 #[cfg(feature = "bluetooth")]
 use crate::bluetooth_helper;
-use crate::state::{AppState, View, StatusMessage, DeviceEntry};
+use crate::state::{AppState, View, StatusMessage, DeviceEntry, SpatialSpeakerEntry};
 use crate::file_browser::FileBrowser;
 use crate::ui;
 
@@ -252,6 +252,18 @@ impl App {
             }
         }
 
+        // Clean disconnect: send TEARDOWN to all devices so they don't keep
+        // stale sessions. Without this, devices may reject or mishandle the
+        // next connection attempt (especially for group streaming).
+        info!("Sending TEARDOWN to all connected devices...");
+        if let Ok(mut client) = self.client.try_lock() {
+            if let Err(e) = client.disconnect().await {
+                tracing::warn!("Disconnect error during shutdown: {}", e);
+            } else {
+                info!("All devices disconnected cleanly");
+            }
+        }
+
         Ok(())
     }
 
@@ -260,6 +272,16 @@ impl App {
         // Handle help overlay first
         if self.state.show_help {
             return Some(Action::ToggleHelp);
+        }
+
+        // Spatial view overrides global arrow/tab keys for positioning
+        if self.state.view == View::Spatial {
+            match key.code {
+                KeyCode::Char('q') => return Some(Action::Quit),
+                KeyCode::Char('?') => return Some(Action::ToggleHelp),
+                KeyCode::Esc => return Some(Action::Back),
+                _ => return self.handle_view_key(key),
+            }
         }
 
         match key.code {
@@ -338,6 +360,21 @@ impl App {
                 KeyCode::Char('o') => Some(Action::BluetoothTogglePower),
                 _ => None,
             },
+            View::Spatial => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => Some(Action::SpatialMoveUp),
+                KeyCode::Down | KeyCode::Char('j') => Some(Action::SpatialMoveDown),
+                KeyCode::Left | KeyCode::Char('h') => Some(Action::SpatialMoveLeft),
+                KeyCode::Right | KeyCode::Char('l') => Some(Action::SpatialMoveRight),
+                KeyCode::Tab => Some(Action::NextView),
+                KeyCode::Char('n') => Some(Action::SpatialSelectNext),
+                KeyCode::Char('p') => Some(Action::SpatialSelectPrev),
+                KeyCode::BackTab => Some(Action::SpatialSelectPrev),
+                KeyCode::Char('b') => Some(Action::SpatialToggleEnabled),
+                KeyCode::Char('m') => Some(Action::SpatialCycleMode),
+                KeyCode::Char('r') => Some(Action::SpatialResetLayout),
+                KeyCode::Char('f') => Some(Action::SpatialFineToggle),
+                _ => None,
+            },
         }
     }
 
@@ -381,12 +418,14 @@ impl App {
             Action::SelectPrev => {
                 match self.state.view {
                     View::Browser => self.browser.select_prev(),
+                    View::Spatial => self.state.spatial.select_prev(),
                     _ => self.state.select_prev(),
                 }
             }
             Action::SelectNext => {
                 match self.state.view {
                     View::Browser => self.browser.select_next(),
+                    View::Spatial => self.state.spatial.select_next(),
                     _ => self.state.select_next(),
                 }
             }
@@ -439,14 +478,20 @@ impl App {
             }
             Action::Disconnect => {
                 info!("Disconnecting from device");
-                let mut client = self.client.lock().await;
-                if let Err(e) = client.disconnect().await {
-                    error!("Disconnect failed: {}", e);
-                    self.state.set_status(StatusMessage::error(format!(
-                        "Disconnect failed: {}",
-                        e
-                    )));
-                }
+                self.state.set_status(StatusMessage::info("Disconnecting..."));
+                let client = Arc::clone(&self.client);
+                let tx = self.action_tx.clone();
+                tokio::spawn(async move {
+                    let mut client = client.lock().await;
+                    if let Err(e) = client.disconnect().await {
+                        error!("Disconnect failed: {}", e);
+                        let _ = tx.send(Action::ShowError(format!(
+                            "Disconnect failed: {}",
+                            e
+                        )));
+                    }
+                    // Disconnected event is emitted by client callback
+                });
             }
             Action::Disconnected => {
                 // Ignore spurious disconnects during connect/reconnect flow.
@@ -459,6 +504,9 @@ impl App {
                     self.state.connected_device = None;
                     self.state.playback_state = PlaybackState::Stopped;
                     self.state.group = None;
+                    // Save and clear spatial layout
+                    self.save_spatial_layout();
+                    self.state.spatial = crate::state::SpatialState::default();
                     for entry in &mut self.state.devices {
                         entry.is_connected = false;
                         entry.is_selected = false;
@@ -479,69 +527,78 @@ impl App {
             }
             Action::Stop => {
                 info!("Stopping playback");
-                let mut client = self.client.lock().await;
-                if let Err(e) = client.stop().await {
-                    error!("Stop failed: {}", e);
-                    self.state.set_status(StatusMessage::error(format!(
-                        "Stop failed: {}",
-                        e
-                    )));
-                } else {
-                    // Reset playback state
-                    self.state.position = 0.0;
-                    self.state.duration = None;
-                }
+                self.state.set_status(StatusMessage::info("Stopping..."));
+                let client = Arc::clone(&self.client);
+                let tx = self.action_tx.clone();
+                tokio::spawn(async move {
+                    let mut client = client.lock().await;
+                    if let Err(e) = client.stop().await {
+                        error!("Stop failed: {}", e);
+                        let _ = tx.send(Action::ShowError(format!(
+                            "Stop failed: {}",
+                            e
+                        )));
+                    }
+                    // PlaybackStateChanged(Stopped) is emitted by client callback
+                });
+                // Reset position/duration immediately for UI responsiveness
+                self.state.position = 0.0;
+                self.state.duration = None;
             }
             Action::SeekForward(secs) => {
                 let new_pos = self.state.position + secs;
                 debug!("Seeking forward to {}", new_pos);
-                let mut client = self.client.lock().await;
-                if let Err(e) = client.seek(new_pos).await {
-                    error!("Seek failed: {}", e);
-                    self.state.set_status(StatusMessage::error(format!(
-                        "Seek failed: {}",
-                        e
-                    )));
+                if let Ok(mut client) = self.client.try_lock() {
+                    if let Err(e) = client.seek(new_pos).await {
+                        error!("Seek failed: {}", e);
+                        self.state.set_status(StatusMessage::error(format!(
+                            "Seek failed: {}",
+                            e
+                        )));
+                    }
                 }
             }
             Action::SeekBackward(secs) => {
                 let new_pos = (self.state.position - secs).max(0.0);
                 debug!("Seeking backward to {}", new_pos);
-                let mut client = self.client.lock().await;
-                if let Err(e) = client.seek(new_pos).await {
-                    error!("Seek failed: {}", e);
-                    self.state.set_status(StatusMessage::error(format!(
-                        "Seek failed: {}",
-                        e
-                    )));
+                if let Ok(mut client) = self.client.try_lock() {
+                    if let Err(e) = client.seek(new_pos).await {
+                        error!("Seek failed: {}", e);
+                        self.state.set_status(StatusMessage::error(format!(
+                            "Seek failed: {}",
+                            e
+                        )));
+                    }
                 }
             }
             Action::VolumeUp => {
                 let new_vol = (self.state.volume + 0.05).min(1.0);
                 debug!("Volume up to {}", new_vol);
-                let mut client = self.client.lock().await;
-                if let Err(e) = client.set_volume(new_vol).await {
-                    error!("Volume change failed: {}", e);
-                    self.state.set_status(StatusMessage::error(format!(
-                        "Volume change failed: {}",
-                        e
-                    )));
-                } else {
-                    self.state.volume = new_vol;
+                if let Ok(mut client) = self.client.try_lock() {
+                    if let Err(e) = client.set_volume(new_vol).await {
+                        error!("Volume change failed: {}", e);
+                        self.state.set_status(StatusMessage::error(format!(
+                            "Volume change failed: {}",
+                            e
+                        )));
+                    } else {
+                        self.state.volume = new_vol;
+                    }
                 }
             }
             Action::VolumeDown => {
                 let new_vol = (self.state.volume - 0.05).max(0.0);
                 debug!("Volume down to {}", new_vol);
-                let mut client = self.client.lock().await;
-                if let Err(e) = client.set_volume(new_vol).await {
-                    error!("Volume change failed: {}", e);
-                    self.state.set_status(StatusMessage::error(format!(
-                        "Volume change failed: {}",
-                        e
-                    )));
-                } else {
-                    self.state.volume = new_vol;
+                if let Ok(mut client) = self.client.try_lock() {
+                    if let Err(e) = client.set_volume(new_vol).await {
+                        error!("Volume change failed: {}", e);
+                        self.state.set_status(StatusMessage::error(format!(
+                            "Volume change failed: {}",
+                            e
+                        )));
+                    } else {
+                        self.state.volume = new_vol;
+                    }
                 }
             }
             Action::SetVolume(vol) => {
@@ -579,22 +636,26 @@ impl App {
             }
             Action::DisbandGroup => {
                 info!("Disbanding group");
-                let mut client = self.client.lock().await;
-                if let Err(e) = client.disband_group().await {
-                    error!("Disband failed: {}", e);
-                    self.state.set_status(StatusMessage::error(format!(
-                        "Disband failed: {}",
-                        e
-                    )));
+                if let Ok(mut client) = self.client.try_lock() {
+                    if let Err(e) = client.disband_group().await {
+                        error!("Disband failed: {}", e);
+                        self.state.set_status(StatusMessage::error(format!(
+                            "Disband failed: {}",
+                            e
+                        )));
+                    } else {
+                        self.state.group = None;
+                        self.state.set_status(StatusMessage::info("Group disbanded"));
+                    }
                 } else {
-                    self.state.group = None;
-                    self.state.set_status(StatusMessage::info("Group disbanded"));
+                    self.state.set_status(StatusMessage::error("Client busy, try again"));
                 }
             }
             Action::GroupChanged => {
                 debug!("Group changed");
-                let client = self.client.lock().await;
-                self.state.update_group(client.group());
+                if let Ok(client) = self.client.try_lock() {
+                    self.state.update_group(client.group());
+                }
             }
             Action::ToggleDeviceSelect => {
                 if let Some(entry) = self.state.devices.get_mut(self.state.device_index) {
@@ -614,22 +675,25 @@ impl App {
                     "Group connected: {} devices",
                     device_count
                 )));
-                let client = self.client.lock().await;
-                // Set connected_device from client (authoritative source)
-                if let Some(device) = client.connected_device() {
-                    self.state.connected_device = Some(device.clone());
-                }
-                self.state.update_group(client.group());
-                // Mark group devices as connected using client's group info
-                if let Some(group) = client.group() {
-                    let leader_id = group.leader().device.id.clone();
-                    let member_ids: Vec<_> = group.members().map(|m| m.device.id.clone()).collect();
-                    for entry in &mut self.state.devices {
-                        if entry.device.id == leader_id || member_ids.contains(&entry.device.id) {
-                            entry.is_connected = true;
+                if let Ok(client) = self.client.try_lock() {
+                    // Set connected_device from client (authoritative source)
+                    if let Some(device) = client.connected_device() {
+                        self.state.connected_device = Some(device.clone());
+                    }
+                    self.state.update_group(client.group());
+                    // Mark group devices as connected using client's group info
+                    if let Some(group) = client.group() {
+                        let leader_id = group.leader().device.id.clone();
+                        let member_ids: Vec<_> = group.members().map(|m| m.device.id.clone()).collect();
+                        for entry in &mut self.state.devices {
+                            if entry.device.id == leader_id || member_ids.contains(&entry.device.id) {
+                                entry.is_connected = true;
+                            }
                         }
                     }
+                    drop(client);
                 }
+                self.init_spatial_for_group().await;
             }
             Action::PlayFileToGroup(path) => {
                 info!("Play file to group: {:?}", path);
@@ -643,10 +707,9 @@ impl App {
             }
             Action::FileSelected(path) => {
                 info!("File selected: {:?}", path);
-                let is_group = {
-                    let client = self.client.lock().await;
-                    client.is_group_connected()
-                };
+                let is_group = self.client.try_lock()
+                    .map(|c| c.is_group_connected())
+                    .unwrap_or(false);
                 if is_group {
                     self.play_file_to_group(path).await;
                 } else {
@@ -697,6 +760,62 @@ impl App {
                 self.state.set_status(StatusMessage::info("EQ reset to flat"));
             }
 
+            // Spatial audio actions
+            Action::SpatialMoveUp => {
+                let step = self.state.spatial.step_size();
+                self.state.spatial.move_selected(0.0, step);
+                self.save_spatial_layout();
+            }
+            Action::SpatialMoveDown => {
+                let step = self.state.spatial.step_size();
+                self.state.spatial.move_selected(0.0, -step);
+                self.save_spatial_layout();
+            }
+            Action::SpatialMoveLeft => {
+                let step = self.state.spatial.step_size();
+                self.state.spatial.move_selected(-step, 0.0);
+                self.save_spatial_layout();
+            }
+            Action::SpatialMoveRight => {
+                let step = self.state.spatial.step_size();
+                self.state.spatial.move_selected(step, 0.0);
+                self.save_spatial_layout();
+            }
+            Action::SpatialSelectNext => {
+                self.state.spatial.select_next();
+            }
+            Action::SpatialSelectPrev => {
+                self.state.spatial.select_prev();
+            }
+            Action::SpatialToggleEnabled => {
+                self.state.spatial.toggle_enabled();
+                let status = if self.state.spatial.enabled {
+                    "Spatial audio enabled"
+                } else {
+                    "Spatial audio disabled"
+                };
+                self.state.set_status(StatusMessage::info(status));
+            }
+            Action::SpatialCycleMode => {
+                self.state.spatial.cycle_mode();
+                let mode_name = match self.state.spatial.mode {
+                    SpatialMode::StereoPan => "Stereo Pan",
+                    SpatialMode::Stft51 => "STFT 5.1",
+                };
+                self.state.set_status(StatusMessage::info(format!("Spatial mode: {}", mode_name)));
+                self.save_spatial_layout();
+            }
+            Action::SpatialResetLayout => {
+                self.state.spatial.reset_layout();
+                self.state.set_status(StatusMessage::info("Layout reset to default"));
+                self.save_spatial_layout();
+            }
+            Action::SpatialFineToggle => {
+                self.state.spatial.fine_mode = !self.state.spatial.fine_mode;
+                let mode = if self.state.spatial.fine_mode { "Fine" } else { "Normal" };
+                self.state.set_status(StatusMessage::info(format!("Movement: {}", mode)));
+            }
+
             Action::Tick => {
                 self.state.clear_expired_status();
 
@@ -706,8 +825,11 @@ impl App {
                     self.state.playback_state = client.playback_state();
                     self.state.stream_stats = client.stats_snapshot();
 
-                    // Send feedback every ~2 seconds during playback to maintain session
-                    if self.state.playback_state == PlaybackState::Playing {
+                    // Send feedback every ~2 seconds to maintain RTSP session.
+                    // Send on ANY connected state (not just Playing) to prevent
+                    // session timeouts during the gap between group connect and
+                    // streaming start (e.g., user navigating to USB tab).
+                    if client.is_connected() {
                         let now = Instant::now();
                         if now.duration_since(self.last_feedback_time) >= Duration::from_secs(2) {
                             if let Err(e) = client.send_feedback().await {
@@ -815,9 +937,12 @@ impl App {
                 }
 
                 if let Some(ref device) = self.state.usb_audio.selected_device.clone() {
-                    let client_connected = {
-                        let client = self.client.lock().await;
-                        client.is_connected()
+                    let client_connected = match self.client.try_lock() {
+                        Ok(client) => client.is_connected(),
+                        Err(_) => {
+                            self.state.set_status(StatusMessage::error("Client busy, try again"));
+                            return;
+                        }
                     };
 
                     if !client_connected {
@@ -844,7 +969,13 @@ impl App {
                     // Ensure RTSP session is ready BEFORE starting capture
                     // This avoids the race where capture fills buffers during slow setup
                     {
-                        let mut client = self.client.lock().await;
+                        let mut client = match self.client.try_lock() {
+                            Ok(c) => c,
+                            Err(_) => {
+                                self.state.set_status(StatusMessage::error("Client busy, try again"));
+                                return;
+                            }
+                        };
                         client.set_render_delay_ms(500);
                         let eq_config = self.state.eq.config.clone();
                         let eq_params = Arc::clone(&self.state.eq.params);
@@ -933,7 +1064,17 @@ impl App {
                             // starts consuming.
 
                             let stream_result = {
-                                let mut client = self.client.lock().await;
+                                let mut client = match self.client.try_lock() {
+                                    Ok(c) => c,
+                                    Err(_) => {
+                                        error!("Client busy during USB streaming start");
+                                        shared.stop.store(true, Ordering::Relaxed);
+                                        let _ = thread.join();
+                                        drop(capture_stream);
+                                        self.state.set_status(StatusMessage::error("Client busy, try again"));
+                                        return;
+                                    }
+                                };
                                 if client.is_group_connected() {
                                     client.start_live_streaming_to_group(decoder).await
                                 } else {
@@ -998,12 +1139,14 @@ impl App {
                 }
                 self.usb_capture_shared = None;
 
-                {
-                    let mut client = self.client.lock().await;
+                // Stop AirPlay playback in background to avoid blocking event loop
+                let client = Arc::clone(&self.client);
+                tokio::spawn(async move {
+                    let mut client = client.lock().await;
                     if let Err(e) = client.stop().await {
                         warn!("Failed to stop AirPlay playback: {}", e);
                     }
-                }
+                });
 
                 self.state.usb_audio.streaming = false;
                 self.state.set_status(StatusMessage::info("USB audio source stopped"));
@@ -1269,9 +1412,12 @@ impl App {
             Action::BluetoothStartSource => {
                 if let Some(ref device) = self.state.bluetooth.connected_device.clone() {
                     // First check if we're connected to an AirPlay device
-                    let client_connected = {
-                        let client = self.client.lock().await;
-                        client.is_connected()
+                    let client_connected = match self.client.try_lock() {
+                        Ok(client) => client.is_connected(),
+                        Err(_) => {
+                            self.state.set_status(StatusMessage::error("Client busy, try again"));
+                            return;
+                        }
                     };
 
                     if !client_connected {
@@ -1368,7 +1514,16 @@ impl App {
                             // Set a moderate render delay (500ms) for live streaming to give
                             // the AirPlay receiver time to build its jitter buffer
                             let stream_result = {
-                                let mut client = self.client.lock().await;
+                                let mut client = match self.client.try_lock() {
+                                    Ok(c) => c,
+                                    Err(_) => {
+                                        error!("Client busy during BT streaming start");
+                                        shared.stop.store(true, Ordering::Relaxed);
+                                        let _ = thread.join();
+                                        self.state.set_status(StatusMessage::error("Client busy, try again"));
+                                        return;
+                                    }
+                                };
                                 client.set_render_delay_ms(500);
                                 // Set up EQ for live streaming
                                 let eq_config = self.state.eq.config.clone();
@@ -1435,19 +1590,22 @@ impl App {
                     shared.stop.store(true, Ordering::Relaxed);
                 }
 
-                // Wait for thread to finish
+                // Join thread on a blocking task to avoid stalling the event loop
                 if let Some(handle) = self.bt_capture_thread.take() {
-                    let _ = handle.join();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = handle.join();
+                    });
                 }
                 self.bt_capture_shared = None;
 
-                // Stop AirPlay playback
-                {
-                    let mut client = self.client.lock().await;
+                // Stop AirPlay playback in background
+                let client = Arc::clone(&self.client);
+                tokio::spawn(async move {
+                    let mut client = client.lock().await;
                     if let Err(e) = client.stop().await {
                         warn!("Failed to stop AirPlay playback: {}", e);
                     }
-                }
+                });
 
                 self.state.bluetooth.is_source_active = false;
                 self.state.bluetooth.streaming = false;
@@ -1500,10 +1658,9 @@ impl App {
                     self.browser.selected_entry().map(|e| &e.name));
                 if let Some(path) = self.browser.activate() {
                     info!("Playing file from browser: {:?}", path);
-                    let is_group = {
-                        let client = self.client.lock().await;
-                        client.is_group_connected()
-                    };
+                    let is_group = self.client.try_lock()
+                        .map(|c| c.is_group_connected())
+                        .unwrap_or(false);
                     if is_group {
                         self.play_file_to_group(path).await;
                     } else {
@@ -1527,6 +1684,9 @@ impl App {
                     self.dispatch(Action::BluetoothConnect);
                 }
             }
+            View::Spatial => {
+                // No select action for spatial view
+            }
         }
     }
 
@@ -1540,23 +1700,26 @@ impl App {
 
         info!("Starting device discovery (5 second timeout)");
 
-        // Spawn scan task
-        let client = self.client.lock().await;
-        match client.discover(Duration::from_secs(5)).await {
-            Ok(devices) => {
-                info!("Discovery complete, found {} devices", devices.len());
-                for device in &devices {
-                    debug!("  - {} ({})", device.name, device.model);
+        // Spawn scan task in background so it doesn't block the event loop
+        let client = Arc::clone(&self.client);
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.discover(Duration::from_secs(5)).await {
+                Ok(devices) => {
+                    info!("Discovery complete, found {} devices", devices.len());
+                    for device in &devices {
+                        debug!("  - {} ({})", device.name, device.model);
+                    }
+                    let _ = tx.send(Action::DevicesScanned(devices));
+                    let _ = tx.send(Action::ShowStatus("Scan complete".to_string()));
                 }
-                let _ = tx.send(Action::DevicesScanned(devices));
-                let _ = tx.send(Action::ShowStatus("Scan complete".to_string()));
+                Err(e) => {
+                    error!("Discovery failed: {}", e);
+                    let _ = tx.send(Action::DevicesScanned(vec![]));
+                    let _ = tx.send(Action::ShowError(format!("Scan failed: {}", e)));
+                }
             }
-            Err(e) => {
-                error!("Discovery failed: {}", e);
-                let _ = tx.send(Action::DevicesScanned(vec![]));
-                let _ = tx.send(Action::ShowError(format!("Scan failed: {}", e)));
-            }
-        }
+        });
     }
 
     /// Connect to selected device.
@@ -1570,35 +1733,37 @@ impl App {
                 device.name
             )));
 
-            // Use a timeout to prevent indefinite hangs
-            let connect_result = tokio::time::timeout(
-                Duration::from_secs(30),
-                async {
-                    let mut client = self.client.lock().await;
-                    client.connect(&device).await
-                }
-            ).await;
+            let client = Arc::clone(&self.client);
+            let tx = self.action_tx.clone();
+            tokio::spawn(async move {
+                let connect_result = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    async {
+                        let mut client = client.lock().await;
+                        client.connect(&device).await
+                    }
+                ).await;
 
-            match connect_result {
-                Ok(Ok(())) => {
-                    info!("Connection successful");
+                match connect_result {
+                    Ok(Ok(())) => {
+                        info!("Connection successful");
+                        // Connected event is emitted by client callback
+                    }
+                    Ok(Err(e)) => {
+                        error!("Connection failed: {}", e);
+                        let _ = tx.send(Action::ShowError(format!(
+                            "Connection failed: {}",
+                            e
+                        )));
+                    }
+                    Err(_) => {
+                        error!("Connection timed out after 30 seconds");
+                        let _ = tx.send(Action::ShowError(
+                            "Connection timed out".to_string(),
+                        ));
+                    }
                 }
-                Ok(Err(e)) => {
-                    error!("Connection failed: {}", e);
-                    self.state.connecting = false;
-                    self.state.set_status(StatusMessage::error(format!(
-                        "Connection failed: {}",
-                        e
-                    )));
-                }
-                Err(_) => {
-                    error!("Connection timed out after 30 seconds");
-                    self.state.connecting = false;
-                    self.state.set_status(StatusMessage::error(
-                        "Connection timed out"
-                    ));
-                }
-            }
+            });
         } else {
             warn!("No device selected for connection");
         }
@@ -1610,24 +1775,26 @@ impl App {
         match self.state.playback_state {
             PlaybackState::Playing => {
                 info!("Pausing playback");
-                let mut client = self.client.lock().await;
-                if let Err(e) = client.pause().await {
-                    error!("Pause failed: {}", e);
-                    self.state.set_status(StatusMessage::error(format!(
-                        "Pause failed: {}",
-                        e
-                    )));
+                if let Ok(mut client) = self.client.try_lock() {
+                    if let Err(e) = client.pause().await {
+                        error!("Pause failed: {}", e);
+                        self.state.set_status(StatusMessage::error(format!(
+                            "Pause failed: {}",
+                            e
+                        )));
+                    }
                 }
             }
             PlaybackState::Paused => {
                 info!("Resuming playback");
-                let mut client = self.client.lock().await;
-                if let Err(e) = client.resume().await {
-                    error!("Resume failed: {}", e);
-                    self.state.set_status(StatusMessage::error(format!(
-                        "Resume failed: {}",
-                        e
-                    )));
+                if let Ok(mut client) = self.client.try_lock() {
+                    if let Err(e) = client.resume().await {
+                        error!("Resume failed: {}", e);
+                        self.state.set_status(StatusMessage::error(format!(
+                            "Resume failed: {}",
+                            e
+                        )));
+                    }
                 }
             }
             _ => {
@@ -1641,10 +1808,9 @@ impl App {
     async fn play_file(&mut self, path: PathBuf) {
         info!("play_file called with path: {:?}", path);
 
-        let is_connected = {
-            let client = self.client.lock().await;
-            client.is_connected()
-        };
+        let is_connected = self.client.try_lock()
+            .map(|c| c.is_connected())
+            .unwrap_or(false);
 
         if !is_connected {
             warn!("Cannot play file - not connected to device");
@@ -1769,10 +1935,9 @@ impl App {
     /// Play an audio file to all group devices simultaneously.
     #[instrument(skip(self), name = "play_file_to_group")]
     async fn play_file_to_group(&mut self, path: PathBuf) {
-        let is_group = {
-            let client = self.client.lock().await;
-            client.is_group_connected()
-        };
+        let is_group = self.client.try_lock()
+            .map(|c| c.is_group_connected())
+            .unwrap_or(false);
 
         if !is_group {
             warn!("Cannot play to group - no group connected");
@@ -1851,7 +2016,13 @@ impl App {
         let mut devices: Vec<&Device> = vec![&connected];
         devices.extend(selected.iter());
 
-        let mut client = self.client.lock().await;
+        let mut client = match self.client.try_lock() {
+            Ok(c) => c,
+            Err(_) => {
+                self.state.set_status(StatusMessage::error("Client busy, try again"));
+                return;
+            }
+        };
         if let Err(e) = client.create_group(&devices).await {
             error!("Group creation failed: {}", e);
             self.state.set_status(StatusMessage::error(format!(
@@ -1872,7 +2043,13 @@ impl App {
     /// Add selected device to group.
     #[instrument(skip(self), name = "add_to_group")]
     async fn add_to_group(&mut self) {
-        let mut client = self.client.lock().await;
+        let mut client = match self.client.try_lock() {
+            Ok(c) => c,
+            Err(_) => {
+                self.state.set_status(StatusMessage::error("Client busy, try again"));
+                return;
+            }
+        };
         if client.group().is_none() {
             warn!("Cannot add to group - no group exists");
             self.state.set_status(StatusMessage::error("No group exists"));
@@ -1905,7 +2082,13 @@ impl App {
             if let Some(member) = group.members.get(self.state.group_member_index) {
                 let device = member.device.clone();
                 info!("Removing {} from group", device.name);
-                let mut client = self.client.lock().await;
+                let mut client = match self.client.try_lock() {
+                    Ok(c) => c,
+                    Err(_) => {
+                        self.state.set_status(StatusMessage::error("Client busy, try again"));
+                        return;
+                    }
+                };
                 if let Err(e) = client.remove_from_group(&device).await {
                     error!("Remove from group failed: {}", e);
                     self.state.set_status(StatusMessage::error(format!(
@@ -1922,5 +2105,102 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Initialize spatial audio state when a group connects.
+    async fn init_spatial_for_group(&mut self) {
+        let group = match &self.state.group {
+            Some(g) => g,
+            None => return,
+        };
+
+        // Build speaker entries from group members
+        let mut speakers = Vec::new();
+        let format_device_id = |id: &airplay_core::DeviceId| -> String {
+            id.0.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(":")
+        };
+        // Add leader
+        speakers.push(SpatialSpeakerEntry {
+            device_id: format_device_id(&group.leader.id),
+            device_name: group.leader.name.clone(),
+            position: (0.0, 2.0),
+        });
+        // Add other members
+        for member in &group.members {
+            if !member.is_leader {
+                speakers.push(SpatialSpeakerEntry {
+                    device_id: format_device_id(&member.device.id),
+                    device_name: member.device.name.clone(),
+                    position: (0.0, 2.0),
+                });
+            }
+        }
+
+        let num_speakers = speakers.len();
+
+        // Create SpatialParams
+        let params = Arc::new(SpatialParams::new(num_speakers));
+        params.set_enabled(true);
+
+        // Set up spatial state
+        self.state.spatial.speakers = speakers;
+        self.state.spatial.params = Some(Arc::clone(&params));
+        self.state.spatial.selected_index = 0;
+        self.state.spatial.enabled = true;
+
+        // Try to load saved layout
+        let device_ids: Vec<String> = self.state.spatial.speakers.iter()
+            .map(|s| s.device_id.clone())
+            .collect();
+        let device_id_refs: Vec<&str> = device_ids.iter().map(|s| s.as_str()).collect();
+
+        if let Some(layout) = crate::spatial_config::load_for_group(&device_id_refs) {
+            info!("Loaded saved spatial layout");
+            crate::spatial_config::apply_layout(&mut self.state.spatial, &layout);
+        } else {
+            // Default: arrange in semicircle
+            self.state.spatial.reset_layout();
+        }
+
+        // Build SpeakerConfig list for the client
+        let speaker_configs: Vec<SpeakerConfig> = self.state.spatial.speakers.iter()
+            .map(|s| SpeakerConfig {
+                device_id: s.device_id.clone(),
+                position: Position { x: s.position.0, y: s.position.1 },
+            })
+            .collect();
+
+        // Set spatial params on the client synchronously to avoid race with streaming start.
+        // This must complete before play_file_to_group / start_live_streaming_to_group.
+        {
+            let mut client = match self.client.try_lock() {
+                Ok(c) => c,
+                Err(_) => {
+                    warn!("Client busy during spatial init, spatial audio may not be configured");
+                    return;
+                }
+            };
+            if let Err(e) = client.set_spatial_params(Arc::clone(&params), speaker_configs) {
+                warn!("Failed to set spatial params: {}", e);
+                self.state.set_status(StatusMessage::error(format!("Spatial setup failed: {}", e)));
+            } else {
+                info!("Spatial params set on client");
+            }
+        }
+
+        info!("Spatial audio initialized for {} speakers", num_speakers);
+    }
+
+    /// Save the current spatial layout to disk.
+    fn save_spatial_layout(&self) {
+        if self.state.spatial.speakers.is_empty() {
+            return;
+        }
+        let device_ids: Vec<String> = self.state.spatial.speakers.iter()
+            .map(|s| s.device_id.clone())
+            .collect();
+        let device_id_refs: Vec<&str> = device_ids.iter().map(|s| s.as_str()).collect();
+        let layout = crate::spatial_config::state_to_layout(&self.state.spatial);
+        crate::spatial_config::save_for_group(&device_id_refs, &layout);
     }
 }

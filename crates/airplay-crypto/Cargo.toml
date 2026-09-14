@@ -2,6 +2,8 @@
 name = "airplay-crypto"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Cryptographic primitives for AirPlay 2 authentication and streaming"
 
 [features]

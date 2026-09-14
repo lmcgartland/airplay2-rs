@@ -2,6 +2,8 @@
 name = "airplay-rtsp"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "RTSP protocol implementation for AirPlay 2"
 
 [dependencies]

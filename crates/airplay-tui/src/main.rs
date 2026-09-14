@@ -8,6 +8,7 @@ mod bluetooth_helper;
 mod file_browser;
 #[cfg(feature = "usb-audio")]
 mod usb_audio;
+mod spatial_config;
 mod state;
 mod ui;
 

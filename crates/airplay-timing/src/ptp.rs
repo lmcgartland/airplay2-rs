@@ -1503,21 +1503,41 @@ pub async fn run_bmca_yield_flow(
 
     tracing::info!("BMCA: Entering slave loop, syncing to {} (filtering other peers)", master_ip);
 
+    let mut slave_loop_count: u64 = 0;
+    let mut sync_count: u64 = 0;
+    let mut followup_count: u64 = 0;
+    let mut delay_resp_count: u64 = 0;
+
     loop {
+        slave_loop_count += 1;
+        // Periodic heartbeat to confirm slave loop is running
+        if slave_loop_count % 100 == 0 {
+            tracing::info!(
+                "BMCA slave heartbeat: loop={}, syncs={}, followups={}, delay_resps={}, t1={}, t2={}, t3={}",
+                slave_loop_count, sync_count, followup_count, delay_resp_count,
+                t1.is_some(), t2.is_some(), t3.is_some()
+            );
+        }
+
         tokio::select! {
             result = event_socket.recv_from(&mut event_buf) => {
                 if let Ok((len, src)) = result {
                     if src.ip() != master_ip {
-                        tracing::trace!("BMCA slave: Ignoring event from {} (not master {})", src.ip(), master_ip);
+                        tracing::debug!("BMCA slave: Ignoring event from {} (not master {})", src.ip(), master_ip);
                         continue;
                     }
                     if let Ok(header) = PtpHeader::parse(&event_buf[..len]) {
                         match header.message_type {
                             PtpMessageType::Sync => {
+                                sync_count += 1;
                                 t2 = Some(PtpTimestamp::now());
-                                tracing::trace!("BMCA slave: Received Sync from {} (seq={})", src.ip(), header.sequence_id);
+                                tracing::debug!("BMCA slave: Received Sync #{} from {} (seq={}, len={})",
+                                    sync_count, src.ip(), header.sequence_id, len);
                             }
                             PtpMessageType::DelayResp => {
+                                delay_resp_count += 1;
+                                tracing::debug!("BMCA slave: Received DelayResp #{} from {} (seq={}, len={})",
+                                    delay_resp_count, src.ip(), header.sequence_id, len);
                                 if len >= 44 {
                                     if let Ok(t4) = PtpTimestamp::parse(&event_buf[34..44]) {
                                         if let (Some(t1v), Some(t2v), Some(t3v)) = (t1, t2, t3) {
@@ -1535,19 +1555,28 @@ pub async fn run_bmca_yield_flow(
                                                 rtt_ns: delay.abs() as u64,
                                             };
 
-                                            tracing::debug!(
-                                                "BMCA slave: synchronized offset={}ns, delay={}ns",
-                                                clock_offset.offset_ns, clock_offset.rtt_ns
+                                            tracing::info!(
+                                                "BMCA slave: SYNCHRONIZED offset={}ns, delay={}ns, rtt={}ns",
+                                                clock_offset.offset_ns, clock_offset.rtt_ns, clock_offset.rtt_ns
                                             );
                                             let _ = offset_tx.send(clock_offset);
+                                        } else {
+                                            tracing::warn!(
+                                                "BMCA slave: DelayResp arrived but missing timestamps: t1={}, t2={}, t3={}",
+                                                t1.is_some(), t2.is_some(), t3.is_some()
+                                            );
                                         }
                                         t1 = None;
                                         t2 = None;
                                         t3 = None;
                                     }
+                                } else {
+                                    tracing::warn!("BMCA slave: DelayResp too short: len={}", len);
                                 }
                             }
-                            _ => {}
+                            other => {
+                                tracing::debug!("BMCA slave: Unexpected event message {:?} from {} (len={})", other, src.ip(), len);
+                            }
                         }
                     }
                 }
@@ -1555,15 +1584,16 @@ pub async fn run_bmca_yield_flow(
             result = general_socket.recv_from(&mut general_buf) => {
                 if let Ok((len, src)) = result {
                     if src.ip() != master_ip {
-                        tracing::trace!("BMCA slave: Ignoring general from {} (not master {})", src.ip(), master_ip);
+                        tracing::debug!("BMCA slave: Ignoring general from {} (not master {})", src.ip(), master_ip);
                         continue;
                     }
                     if let Ok(header) = PtpHeader::parse(&general_buf[..len]) {
                         if header.message_type == PtpMessageType::FollowUp && len >= 44 {
+                            followup_count += 1;
                             if let Ok(ts) = PtpTimestamp::parse(&general_buf[34..44]) {
                                 t1 = Some(ts);
-                                tracing::trace!("BMCA slave: Received Follow_Up from {} (seq={}, t1={}.{:09}s)",
-                                    src.ip(), header.sequence_id, ts.seconds, ts.nanoseconds);
+                                tracing::debug!("BMCA slave: Received Follow_Up #{} from {} (seq={}, t1={}.{:09}s)",
+                                    followup_count, src.ip(), header.sequence_id, ts.seconds, ts.nanoseconds);
 
                                 // Send Delay_Req
                                 delay_req_seq = delay_req_seq.wrapping_add(1);
@@ -1582,9 +1612,12 @@ pub async fn run_bmca_yield_flow(
                                 if let Err(e) = event_socket.send_to(&delay_packet, event_dest).await {
                                     tracing::warn!("BMCA slave: Failed to send Delay_Req: {}", e);
                                 } else {
-                                    tracing::trace!("BMCA slave: Sent Delay_Req (seq={})", delay_req_seq);
+                                    tracing::debug!("BMCA slave: Sent Delay_Req (seq={})", delay_req_seq);
                                 }
                             }
+                        } else {
+                            tracing::debug!("BMCA slave: General msg {:?} from {} (len={})",
+                                header.message_type, src.ip(), len);
                         }
                     }
                 }

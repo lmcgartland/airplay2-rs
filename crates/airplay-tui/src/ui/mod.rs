@@ -4,6 +4,7 @@ mod devices;
 mod browser;
 mod player;
 mod help;
+mod spatial;
 #[cfg(feature = "usb-audio")]
 mod usb_audio;
 #[cfg(feature = "bluetooth")]
@@ -13,6 +14,7 @@ pub use devices::render_devices;
 pub use browser::render_browser;
 pub use player::render_player;
 pub use help::render_help;
+pub use spatial::render_spatial;
 #[cfg(feature = "usb-audio")]
 pub use usb_audio::render_usb_audio;
 #[cfg(feature = "bluetooth")]
@@ -55,6 +57,7 @@ pub fn render(frame: &mut Frame, state: &AppState, browser: &FileBrowser) {
         View::UsbAudio => render_usb_audio(frame, chunks[1], state),
         #[cfg(feature = "bluetooth")]
         View::Bluetooth => render_bluetooth(frame, chunks[1], state),
+        View::Spatial => render_spatial(frame, chunks[1], state),
     }
 
     // Render footer with status
@@ -122,6 +125,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
             View::UsbAudio => "r: Refresh  Enter: Select  u: Start streaming  x: Stop",
             #[cfg(feature = "bluetooth")]
             View::Bluetooth => "s: Scan  p: Pair  c: Connect  d: Disconnect  u: Source  o: Radio on/off",
+            View::Spatial => "Arrows: Move  n/p: Select  b: Toggle  m: Mode  f: Fine  r: Reset",
         };
         Span::styled(hints, Style::default().fg(Color::DarkGray))
     };

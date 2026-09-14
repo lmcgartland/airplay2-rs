@@ -63,5 +63,8 @@ pub use airplay_audio::{LiveAudioDecoder, LiveFrameSender, LivePcmFrame};
 pub use airplay_audio::{EqConfig, EqParams};
 pub use airplay_audio::eq::MAX_GAIN_DB;
 
+// Spatial audio types
+pub use airplay_audio::{SpatialMixer, SpatialParams, SpatialMode, SpatialSnapshot, Position, SpeakerConfig, SpeakerParams};
+
 // Timing types needed for group streaming
 pub use airplay_timing::ClockOffset;

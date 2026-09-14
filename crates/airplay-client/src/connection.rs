@@ -10,9 +10,9 @@ use std::path::PathBuf;
 use std::fs;
 // Timing imports reserved for future use
 // use airplay_timing::{TimingProtocol, NtpTimingClient, PtpClient};
-use airplay_audio::{AudioStreamer, AudioDecoder, LiveAudioDecoder, RtpSender, RtpReceiver, EqConfig, EqParams};
+use airplay_audio::{AudioStreamer, AudioDecoder, LiveAudioDecoder, RtpSender, RtpReceiver, EqConfig, EqParams, SpatialParams, SpeakerConfig};
 use airplay_audio::cipher::{PacketCipher, ChaChaPacketCipher};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use airplay_crypto::chacha::ControlCipher;
 use airplay_crypto::chacha::AudioCipher;
 use airplay_crypto::keys::SharedSecret;
@@ -204,6 +204,8 @@ pub struct Connection {
     timing_offset: Option<ClockOffset>,
     timing_tx: Option<watch::Sender<ClockOffset>>,
     control_task: Option<tokio::task::JoinHandle<()>>,
+    /// Stop flag for the control channel thread.
+    control_stop: Arc<AtomicBool>,
     timing_task: Option<JoinHandle<()>>,
     timing_server: Option<NtpTimingServer>,
     /// PTP master instance (sender IS the timing master)
@@ -222,6 +224,10 @@ pub struct Connection {
     eq_config: Option<EqConfig>,
     /// Shared equalizer parameters for real-time control.
     eq_params: Option<Arc<EqParams>>,
+    /// Shared spatial parameters for real-time control.
+    spatial_params: Option<Arc<SpatialParams>>,
+    /// Speaker configurations for spatial audio.
+    spatial_speakers: Option<Vec<SpeakerConfig>>,
     /// Stream statistics (shared with control channel threads).
     stream_stats: Arc<crate::stats::StreamStats>,
 }
@@ -338,10 +344,13 @@ impl Connection {
             ptp_master_clock_id: None,
             control_receiver: None,
             control_task: None,
+            control_stop: Arc::new(AtomicBool::new(false)),
             events_stream: None,
             render_delay_ms: 0,
             eq_config: None,
             eq_params: None,
+            spatial_params: None,
+            spatial_speakers: None,
             stream_stats: crate::stats::StreamStats::new(),
         })
     }
@@ -503,10 +512,13 @@ impl Connection {
             ptp_master_clock_id: None,
             control_receiver: None,
             control_task: None,
+            control_stop: Arc::new(AtomicBool::new(false)),
             events_stream: None,
             render_delay_ms: 0,
             eq_config: None,
             eq_params: None,
+            spatial_params: None,
+            spatial_speakers: None,
             stream_stats: crate::stats::StreamStats::new(),
         })
     }
@@ -704,10 +716,13 @@ impl Connection {
             ptp_master_clock_id: None,
             control_receiver: None,
             control_task: None,
+            control_stop: Arc::new(AtomicBool::new(false)),
             events_stream: None,
             render_delay_ms: 0,
             eq_config: None,
             eq_params: None,
+            spatial_params: None,
+            spatial_speakers: None,
             stream_stats: crate::stats::StreamStats::new(),
         })
     }
@@ -917,8 +932,24 @@ impl Connection {
                             }
                         }
 
-                        // Wait briefly for initial offset calculation
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        // Wait for first real clock offset from BMCA slave loop.
+                        // The slave loop needs a full Sync/Follow_Up/Delay_Req/Delay_Resp
+                        // exchange (~1-2s) before it can calculate the offset. A blind 500ms
+                        // sleep often reads zero, causing group sync packets to use wrong timestamps.
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            offset_rx.changed(),
+                        ).await {
+                            Ok(Ok(())) => {
+                                tracing::info!("BMCA: First clock offset received from slave loop");
+                            }
+                            Ok(Err(_)) => {
+                                tracing::warn!("BMCA: offset channel closed before first offset");
+                            }
+                            Err(_) => {
+                                tracing::warn!("BMCA: Timeout waiting for first clock offset (5s), using zero");
+                            }
+                        }
                         let initial_offset = *offset_rx.borrow_and_update();
                         self.timing_offset = Some(initial_offset);
 
@@ -991,6 +1022,16 @@ impl Connection {
             master.stop().await;
         }
 
+        // Signal control thread to stop and wait for it to exit
+        self.control_stop.store(true, Ordering::Release);
+        if let Some(task) = self.control_task.take() {
+            // Give the control thread time to notice the stop flag (polls every 5ms)
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                task,
+            ).await;
+        }
+
         // Drop control receiver (closes the UDP socket)
         self.control_receiver = None;
 
@@ -1053,11 +1094,17 @@ impl Connection {
         if self.render_delay_ms > 0 {
             streamer.set_render_delay_ms(self.render_delay_ms).await;
         }
-        if let Some(offset) = self.timing_offset {
-            streamer.set_timing_offset(offset).await;
-        }
+        // Use live watch channel for current offset (not stale setup-time value).
+        // The BMCA slave loop continuously updates the offset, so the watch channel
+        // has the latest value — much better than the snapshot from setup() time.
         if let Some(ref tx) = self.timing_tx {
-            streamer.set_timing_updates(tx.subscribe()).await;
+            let rx = tx.subscribe();
+            let current_offset = *rx.borrow();
+            tracing::info!("Streaming: using live PTP offset = {} ns", current_offset.offset_ns);
+            streamer.set_timing_offset(current_offset).await;
+            streamer.set_timing_updates(rx).await;
+        } else if let Some(offset) = self.timing_offset {
+            streamer.set_timing_offset(offset).await;
         }
         // Enable PTP sync mode (PT=87) if we have a remote clock ID from BMCA
         if self.stream_config.timing_protocol == TimingProtocol::Ptp {
@@ -1069,6 +1116,11 @@ impl Connection {
         // Set up equalizer if configured
         if let (Some(config), Some(params)) = (self.eq_config.take(), self.eq_params.clone()) {
             streamer.set_eq_params(config, params).await;
+        }
+
+        // Set up spatial audio if configured
+        if let (Some(params), Some(speakers)) = (self.spatial_params.clone(), self.spatial_speakers.clone()) {
+            streamer.set_spatial_params(params, speakers).await;
         }
 
         // FLUSH before streaming — tells receiver to clear buffers and expect audio
@@ -1098,16 +1150,22 @@ impl Connection {
         // Spawn control channel on a dedicated blocking thread for low-latency
         // retransmit handling. Uses 5ms recv timeout (well under HomePod's 70ms buffer)
         // so retransmit requests are handled promptly.
+        self.control_stop.store(false, Ordering::Release);
         let control_task = if let Some(ref control_rx) = self.control_receiver {
             use airplay_audio::RetransmitRequest;
             let control_rx_clone = Arc::clone(control_rx);
             let streamer_clone = streamer.clone();
             let rt_handle = tokio::runtime::Handle::current();
             let stats = Arc::clone(&self.stream_stats);
+            let stop_flag = Arc::clone(&self.control_stop);
 
             Some(tokio::task::spawn_blocking(move || {
                 tracing::debug!("Control channel thread started (5ms poll)");
                 loop {
+                    if stop_flag.load(Ordering::Acquire) {
+                        tracing::info!("Control channel thread: stop flag set, exiting");
+                        break;
+                    }
                     // Use raw receive to handle all packet formats (including
                     // retransmit requests which have 8-byte headers without SSRC).
                     // 5ms timeout keeps retransmit latency low.
@@ -1225,16 +1283,27 @@ impl Connection {
         if self.render_delay_ms > 0 {
             streamer.set_render_delay_ms(self.render_delay_ms).await;
         }
-        if let Some(offset) = self.timing_offset {
-            streamer.set_timing_offset(offset).await;
-        }
+        // Use live watch channel for current offset (not stale setup-time value).
+        // The BMCA slave loop continuously updates the offset, so the watch channel
+        // has the latest value — much better than the snapshot from setup() time.
         if let Some(ref tx) = self.timing_tx {
-            streamer.set_timing_updates(tx.subscribe()).await;
+            let rx = tx.subscribe();
+            let current_offset = *rx.borrow();
+            tracing::info!("Streaming: using live PTP offset = {} ns", current_offset.offset_ns);
+            streamer.set_timing_offset(current_offset).await;
+            streamer.set_timing_updates(rx).await;
+        } else if let Some(offset) = self.timing_offset {
+            streamer.set_timing_offset(offset).await;
         }
 
         // Set up equalizer if configured
         if let (Some(config), Some(params)) = (self.eq_config.take(), self.eq_params.clone()) {
             streamer.set_eq_params(config, params).await;
+        }
+
+        // Set up spatial audio if configured
+        if let (Some(params), Some(speakers)) = (self.spatial_params.clone(), self.spatial_speakers.clone()) {
+            streamer.set_spatial_params(params, speakers).await;
         }
 
         // FLUSH before streaming
@@ -1261,16 +1330,22 @@ impl Connection {
         }
 
         // Spawn control channel for retransmit handling
+        self.control_stop.store(false, Ordering::Release);
         let control_task = if let Some(ref control_rx) = self.control_receiver {
             use airplay_audio::RetransmitRequest;
             let control_rx_clone = Arc::clone(control_rx);
             let streamer_clone = streamer.clone();
             let rt_handle = tokio::runtime::Handle::current();
             let stats = Arc::clone(&self.stream_stats);
+            let stop_flag = Arc::clone(&self.control_stop);
 
             Some(tokio::task::spawn_blocking(move || {
                 tracing::debug!("Control channel thread started for live streaming (5ms poll)");
                 loop {
+                    if stop_flag.load(Ordering::Acquire) {
+                        tracing::info!("Control channel thread (live): stop flag set, exiting");
+                        break;
+                    }
                     match control_rx_clone.recv_raw_timeout(std::time::Duration::from_millis(5)) {
                         Ok(Some((data, _addr))) => {
                             if data.len() < 4 {
@@ -1434,6 +1509,24 @@ impl Connection {
     /// Get a clone of the EQ config if set.
     pub fn eq_config(&self) -> Option<EqConfig> {
         self.eq_config.clone()
+    }
+
+    /// Set up spatial audio with shared parameters and speaker configurations.
+    ///
+    /// Must be called before `start_streaming()` or `start_streaming_live()`.
+    pub fn set_spatial_params(&mut self, params: Arc<SpatialParams>, speakers: Vec<SpeakerConfig>) {
+        self.spatial_params = Some(params);
+        self.spatial_speakers = Some(speakers);
+    }
+
+    /// Get a clone of the spatial params Arc if set.
+    pub fn spatial_params(&self) -> Option<Arc<SpatialParams>> {
+        self.spatial_params.clone()
+    }
+
+    /// Get a clone of the spatial speaker configs if set.
+    pub fn spatial_speakers(&self) -> Option<Vec<SpeakerConfig>> {
+        self.spatial_speakers.clone()
     }
 
     /// Set volume.
@@ -1760,21 +1853,31 @@ impl Connection {
             seq,
             rtptime,
         );
-        if let Err(e) = self.rtsp.send(flush_req).await {
-            tracing::warn!("FLUSH failed (continuing anyway): {}", e);
-        } else {
-            tracing::info!("FLUSH sent (seq={}, rtptime={})", seq, rtptime);
-        }
+        self.rtsp.send(flush_req).await?;
+        tracing::info!("FLUSH sent (seq={}, rtptime={})", seq, rtptime);
         Ok(())
     }
 
     /// Send RECORD to resume playback on this connection.
+    ///
+    /// Uses record_with_info (seq=0, rtptime=0) to match a preceding FLUSH reset.
     pub async fn send_record(&mut self) -> Result<()> {
-        let record_req = RtspRequest::record(self.session.request_uri());
-        if let Err(e) = self.rtsp.send(record_req).await {
-            tracing::warn!("RECORD failed (continuing anyway): {}", e);
-        } else {
-            tracing::info!("RECORD sent");
+        let record_req = RtspRequest::record_with_info(
+            self.session.request_uri(),
+            0,
+            0,
+        );
+        match self.rtsp.send(record_req).await {
+            Ok(resp) => {
+                if resp.status_code == 200 {
+                    tracing::info!("RECORD sent successfully");
+                } else {
+                    tracing::warn!("RECORD returned status {} (continuing)", resp.status_code);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("RECORD failed (continuing anyway): {}", e);
+            }
         }
         Ok(())
     }
