@@ -420,8 +420,8 @@ impl NtpTimingServer {
                         }
                     }
                 }
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
                         break;
                     }
                 }
@@ -694,6 +694,23 @@ mod tests {
             assert!(response.send_time > 0);
 
             server.stop().await;
+        }
+
+        /// Regression test: dropping an NtpTimingServer without calling
+        /// `stop()` must end its background task. Before the fix,
+        /// `shutdown_rx.changed()` kept returning `Err` once the sender was
+        /// dropped, and `run_loop` busy-spun at 100% of a CPU core.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn run_loop_exits_when_server_is_dropped() {
+            let mut server = NtpTimingServer::start(44100).await.unwrap();
+            let handle = server.task_handle.take().unwrap();
+            drop(server);
+
+            let finished = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+            assert!(
+                finished.is_ok(),
+                "run_loop still running 2s after the server was dropped (busy loop)"
+            );
         }
     }
 
