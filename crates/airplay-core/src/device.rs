@@ -64,7 +64,12 @@ pub struct Device {
     pub homekit_home_id: Option<String>,
 
     // --- Group / multi-room ---
+    /// Group UUID from `gid` TXT field. `None` if missing or unreadable.
+    ///
+    /// Idle HomePod mini stereo pairs may advertise `<UUID>+1+<UUID>`; only the
+    /// leading UUID is kept, so this is not a unique group identity.
     pub group_id: Option<uuid::Uuid>,
+    /// Is group leader from `igl` TXT field.
     pub is_group_leader: bool,
     /// Group public name from `gpn` TXT field.
     pub group_public_name: Option<String>,
@@ -74,11 +79,13 @@ pub struct Device {
     pub home_group_id: Option<String>,
     /// Household ID from `hmid` TXT field.
     pub household_id: Option<String>,
-    /// Parent group UUID from `pgid` TXT field.
+    /// Parent group UUID from `pgid` TXT field. `None` if missing or unreadable.
+    ///
+    /// Compound `<UUID>+1+<UUID>` values are reduced to the leading UUID (see `group_id`).
     pub parent_group_id: Option<uuid::Uuid>,
     /// Parent group contains discoverable leader from `pgcgl` TXT field.
     pub parent_group_contains_discoverable_leader: bool,
-    /// Tight sync UUID from `tsid` TXT field.
+    /// Tight sync UUID from `tsid` TXT field. `None` if missing or not a single UUID.
     pub tight_sync_id: Option<uuid::Uuid>,
 
     // --- RAOP (legacy AirPlay 1) ---

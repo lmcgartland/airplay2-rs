@@ -78,13 +78,13 @@ TXT keys are extensible. A sender MUST ignore unknown keys and MUST NOT assume p
 | `pk` | publicKey | hex | Public key used by pairing flows on some devices |
 | `pi` | publicCUAirPlayPairingIdentity | UUID-ish | Pairing identity (varies by device) |
 | `psi` | publicCUSystemPairingIdentity | UUID-ish | System pairing identity (varies by device) |
-| `gid` | groupUUID | UUID | Group identifier (multi-room) |
+| `gid` | groupUUID | UUID (see note) | Group identifier (multi-room) |
 | `gpn` | groupPublicName | string | Group public name |
 | `igl` | isGroupLeader | 0/1 | "Is group leader" (multi-room) |
 | `gcgl` | groupContainsDiscoverableLeader | 0/1 | Group contains discoverable leader |
-| `pgid` | parentGroupUUID | UUID | Parent group UUID |
+| `pgid` | parentGroupUUID | UUID (see note) | Parent group UUID |
 | `pgcgl` | parentGroupContainsDiscoverableLeader | 0/1 | Parent group contains discoverable leader |
-| `tsid` | tightSyncUUID | UUID | Tight sync UUID |
+| `tsid` | tightSyncUUID | UUID (see note) | Tight sync UUID |
 | `acl` | accessControlLevel | int | Access control level (receiver policy) |
 | `hkid` | homeKitHomeUUID | UUID-ish | HomeKit home UUID |
 | `hgid` | homeGroupUUID | UUID-ish | Home group UUID |
@@ -94,6 +94,12 @@ TXT keys are extensible. A sender MUST ignore unknown keys and MUST NOT assume p
 | `btaddr` | bluetoothAddress | string | Bluetooth address |
 | `manufacturer` | manufacturer | string | Manufacturer |
 | `serialNumber` | serialNumber | string | Serial number |
+
+> **Observed compound form (`gid`, `pgid`):** Idle HomePod mini stereo pairs (HomePod software 27.0)
+> advertise `<UUID1>+1+<UUID2>` instead of a single UUID. `<UUID1>` equals the pair's `tsid`; the
+> meaning of the middle number and `<UUID2>` is unknown. `TxtRecordParser` keeps only `<UUID1>`.
+> Compound `tsid` values have not been observed and are rejected. Unreadable group identifiers are
+> treated as absent instead of failing the whole record.
 
 ### 1.5 TXT Keys: `_raop._tcp` (Selected)
 
