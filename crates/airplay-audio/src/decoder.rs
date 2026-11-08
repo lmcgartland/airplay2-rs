@@ -8,7 +8,7 @@ use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
-use symphonia::core::io::{MediaSourceStream, ReadOnlySource};
+use symphonia::core::io::{MediaSource, MediaSourceStream, ReadOnlySource};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
@@ -69,6 +69,20 @@ impl AudioDecoder {
         let cursor = Cursor::new(data.to_vec());
         let source = ReadOnlySource::new(cursor);
         let mss = MediaSourceStream::new(Box::new(source), Default::default());
+
+        let mut hint = Hint::new();
+        if let Some(ext) = hint_ext {
+            hint.with_extension(ext);
+        }
+
+        Self::from_media_source(mss, hint)
+    }
+
+    /// Open from any `MediaSource` — e.g. a download that is still in progress,
+    /// whose `Read` blocks until more bytes arrive, so playback can start
+    /// before the whole file is available.
+    pub fn from_reader(source: Box<dyn MediaSource>, hint_ext: Option<&str>) -> Result<Self> {
+        let mss = MediaSourceStream::new(source, Default::default());
 
         let mut hint = Hint::new();
         if let Some(ext) = hint_ext {
@@ -523,6 +537,15 @@ mod tests {
         fn error_on_nonexistent_file() {
             let result = AudioDecoder::open("/nonexistent/path/file.wav");
             assert!(result.is_err());
+        }
+
+        #[test]
+        fn from_reader_decodes_a_media_source() {
+            let wav_data = create_wav_data(44100, 2, &vec![0i16; 4410 * 2]);
+            let source = ReadOnlySource::new(Cursor::new(wav_data));
+            let decoder = AudioDecoder::from_reader(Box::new(source), Some("wav")).unwrap();
+            assert_eq!(decoder.sample_rate(), 44100);
+            assert_eq!(decoder.channels(), 2);
         }
 
         #[test]
