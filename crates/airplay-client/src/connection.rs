@@ -829,6 +829,17 @@ impl Connection {
         tracing::info!("Control port bound to {}", actual_control_port);
         self.control_receiver = Some(Arc::new(control_receiver));
 
+        // Receivers such as Apple TV start their NTP exchange right after SETUP
+        // phase 1 and reject a phase 2 that overtakes it with `400 Bad Request`
+        // (intermittently: it is a race against the receiver's first timing
+        // request). Give the exchange a moment to begin; proceed regardless on
+        // timeout, as not every receiver queries our timing server.
+        if let Some(server) = &self.timing_server {
+            if !server.wait_for_requests(1, std::time::Duration::from_millis(1500)).await {
+                warn!("Receiver sent no NTP timing request before SETUP phase 2; continuing anyway");
+            }
+        }
+
         // SETUP Phase 2 (audio stream)
         let setup2_body = self.session.build_setup_phase2()?;
         let setup2_req = RtspRequest::setup(self.session.request_uri(), setup2_body);
