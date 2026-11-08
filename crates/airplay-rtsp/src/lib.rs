@@ -10,6 +10,7 @@
 //! - Two-phase SETUP handling
 
 mod connection;
+pub mod dmap;
 mod request;
 mod response;
 mod session;
