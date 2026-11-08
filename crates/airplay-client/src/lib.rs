@@ -41,11 +41,13 @@ mod playback;
 mod builder;
 mod events;
 mod raop_connection;
+mod receiver_events;
 mod stats;
 
 pub use client::AirPlayClient;
 pub use connection::{Connection, StreamingParams};
 pub use raop_connection::RaopConnection;
+pub use receiver_events::{ReceiverEvent, ReceiverRequest, RemoteCommand};
 pub use group::{DeviceGroup, GroupMember};
 pub use playback::{PlaybackState, PlaybackInfo};
 pub use builder::ClientBuilder;

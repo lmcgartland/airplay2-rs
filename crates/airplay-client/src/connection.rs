@@ -21,7 +21,8 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 use tracing::{debug, info, warn};
 use airplay_timing::{NtpTimingServer, ClockOffset, PtpMaster, PTP_EVENT_PORT, run_ptp_slave, run_bmca_yield_flow, run_ptp_group_master_flow};
 use airplay_core::stream::TimingProtocol;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
+use crate::receiver_events::ReceiverEvent;
 use tokio::task::JoinHandle;
 use tokio::net::TcpStream;
 
@@ -216,6 +217,11 @@ pub struct Connection {
     control_receiver: Option<Arc<RtpReceiver>>,
     /// Reverse connection to device's events port (required before RECORD)
     events_stream: Option<TcpStream>,
+    /// Pair-verify shared secret, from which the events channel keys derive
+    /// (None for pairing flows that don't produce one).
+    events_secret: Option<[u8; 32]>,
+    /// Requests the receiver sent on the events channel (see `take_receiver_events`).
+    receiver_events: Option<mpsc::UnboundedReceiver<ReceiverEvent>>,
     /// Remote PTP master clock identity (from BMCA yield flow)
     ptp_master_clock_id: Option<[u8; 8]>,
     /// Render delay in ms added to NTP timestamps for extra retransmit headroom.
@@ -330,6 +336,7 @@ impl Connection {
         tracing::debug!("Using random shk for audio encryption (sent in SETUP phase 2)");
 
         session.set_paired()?;
+        let events_secret: Option<[u8; 32]> = None;
 
         Ok(Self {
             device,
@@ -350,6 +357,8 @@ impl Connection {
             control_task: None,
             control_stop: Arc::new(AtomicBool::new(false)),
             events_stream: None,
+            events_secret,
+            receiver_events: None,
             render_delay_ms: 0,
             eq_config: None,
             eq_params: None,
@@ -499,6 +508,7 @@ impl Connection {
         }
 
         session.set_paired()?;
+        let events_secret = pair_verify.shared_secret();
 
         Ok(Self {
             device,
@@ -519,6 +529,8 @@ impl Connection {
             control_task: None,
             control_stop: Arc::new(AtomicBool::new(false)),
             events_stream: None,
+            events_secret,
+            receiver_events: None,
             render_delay_ms: 0,
             eq_config: None,
             eq_params: None,
@@ -704,6 +716,7 @@ impl Connection {
         }
 
         session.set_paired()?;
+        let events_secret = pair_verify.shared_secret();
 
         Ok(Self {
             device,
@@ -724,6 +737,8 @@ impl Connection {
             control_task: None,
             control_stop: Arc::new(AtomicBool::new(false)),
             events_stream: None,
+            events_secret,
+            receiver_events: None,
             render_delay_ms: 0,
             eq_config: None,
             eq_params: None,
@@ -819,7 +834,14 @@ impl Connection {
         match TcpStream::connect(events_addr).await {
             Ok(stream) => {
                 tracing::info!("Events connection established");
-                self.events_stream = Some(stream);
+                match self.events_secret {
+                    // Service the channel: answer the receiver's requests and
+                    // forward them to `take_receiver_events`.
+                    Some(secret) => {
+                        self.receiver_events = Some(crate::receiver_events::spawn(stream, secret));
+                    }
+                    None => self.events_stream = Some(stream),
+                }
             }
             Err(e) => {
                 // Not fatal - owntone says "proceeding anyway" if this fails
@@ -1639,6 +1661,14 @@ impl Connection {
         let resp = self.rtsp.send(req).await?;
         debug!("SET_PARAMETER progress: status={}", resp.status_code);
         Ok(())
+    }
+
+    /// Requests the receiver sends on the events channel, e.g. remote-control
+    /// commands issued on the receiver itself (play/pause/seek on an Apple TV
+    /// remote). Each is answered automatically; this is how the application
+    /// gets to see them. Available after `setup()`, and only once per setup.
+    pub fn take_receiver_events(&mut self) -> Option<mpsc::UnboundedReceiver<ReceiverEvent>> {
+        self.receiver_events.take()
     }
 
     /// Send feedback/keepalive to the receiver.
