@@ -8,7 +8,7 @@ use airplay_core::{AudioFormat, error::Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use std::time::Duration;
 
-use crate::decoder::DecodedFrame;
+use crate::decoder::{convert_channels, DecodedFrame};
 
 /// Frame of PCM audio sent to the live decoder.
 #[derive(Debug, Clone)]
@@ -190,12 +190,13 @@ impl LiveAudioDecoder {
         let target_rate = target_format.sample_rate.as_hz();
         let source_rate = self.sample_rate;
 
-        // Initialize resampler lazily if needed
+        // Initialize resampler lazily if needed. It runs after the channel
+        // conversion below, so it works on the target channel count.
         if source_rate != target_rate && self.resampler.is_none() {
             self.resampler = Some(airplay_resampler::Resampler::new(
                 source_rate,
                 target_rate,
-                self.channels,
+                target_format.channels,
             )?);
         }
 
@@ -207,15 +208,22 @@ impl LiveAudioDecoder {
         while collected_samples.len() < target_samples {
             match self.decode_frame()? {
                 Some(frame) => {
+                    // Frames carry their own layout; the packets we build have
+                    // a fixed one (see `convert_channels`).
+                    let samples = convert_channels(
+                        &frame.samples,
+                        frame.channels as usize,
+                        target_format.channels as usize,
+                    );
                     if source_rate == target_rate {
-                        collected_samples.extend(frame.samples);
+                        collected_samples.extend(samples);
                     } else {
                         // High-quality sinc resampling
                         let resampled = self
                             .resampler
                             .as_mut()
                             .expect("resampler should be initialized")
-                            .process(&frame.samples)?;
+                            .process(&samples)?;
                         collected_samples.extend(resampled);
                     }
                 }
@@ -289,6 +297,29 @@ mod tests {
             samples.push(sample); // Right
         }
         samples
+    }
+
+    #[test]
+    fn mono_source_is_expanded_to_stereo_at_the_right_speed() {
+        // One second of a mono ramp. Read as stereo it would be half a
+        // second long, played twice as fast.
+        let (sender, mut decoder) = LiveAudioDecoder::create_pair(44100, 1, 4);
+        let mono: Vec<i16> = (0..44100).map(|i| (i % 1000) as i16).collect();
+        sender.send(LivePcmFrame { samples: mono.clone(), channels: 1, sample_rate: 44100 });
+        drop(sender);
+
+        let format = test_format(); // 44.1 kHz stereo
+        let mut out = Vec::new();
+        while let Ok(Some(f)) = decoder.decode_resampled(&format, 352) {
+            out.extend(f.samples);
+        }
+        // 44100 mono frames -> 44100 stereo frames (whole packets only).
+        assert!(out.len() >= 2 * (44100 - 352), "got {} samples", out.len());
+        // Both channels carry the same signal, in order.
+        for i in 0..1000 {
+            assert_eq!(out[2 * i], mono[i]);
+            assert_eq!(out[2 * i + 1], mono[i]);
+        }
     }
 
     #[test]
