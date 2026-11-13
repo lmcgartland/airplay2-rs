@@ -1553,6 +1553,34 @@ impl Connection {
         Ok(())
     }
 
+    /// Send track metadata (title/artist/album/length) for the receiver's
+    /// "now playing" display. `rtptime` is the RTP timestamp of the track's
+    /// first sample.
+    pub async fn set_track_metadata(&mut self, meta: &airplay_rtsp::dmap::TrackMetadata, rtptime: u32) -> Result<()> {
+        let body = airplay_rtsp::dmap::encode_track_metadata(meta);
+        let req = RtspRequest::set_parameter_dmap(self.session.request_uri(), rtptime, body);
+        let resp = self.rtsp.send(req).await?;
+        debug!("SET_PARAMETER metadata: status={}", resp.status_code);
+        Ok(())
+    }
+
+    /// Send cover art (`content_type`: `image/jpeg` or `image/png`).
+    pub async fn set_artwork(&mut self, image: Vec<u8>, content_type: &str, rtptime: u32) -> Result<()> {
+        let req = RtspRequest::set_parameter_artwork(self.session.request_uri(), rtptime, content_type, image);
+        let resp = self.rtsp.send(req).await?;
+        debug!("SET_PARAMETER artwork: status={}", resp.status_code);
+        Ok(())
+    }
+
+    /// Send playback progress as RTP timestamps (track start, current
+    /// position, track end) so the receiver can draw a seek bar.
+    pub async fn set_progress(&mut self, start: u32, current: u32, end: u32) -> Result<()> {
+        let req = RtspRequest::set_parameter_progress(self.session.request_uri(), start, current, end);
+        let resp = self.rtsp.send(req).await?;
+        debug!("SET_PARAMETER progress: status={}", resp.status_code);
+        Ok(())
+    }
+
     /// Send feedback/keepalive to the receiver.
     ///
     /// AirPlay 2 receivers expect periodic feedback requests (~every 2 seconds).

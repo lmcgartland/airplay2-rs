@@ -151,6 +151,33 @@ impl RtspRequest {
             .body(body)
     }
 
+    /// Track metadata (title/artist/album) as DMAP tagged items. `rtptime` is
+    /// the RTP timestamp of the track's first sample.
+    pub fn set_parameter_dmap(uri: impl Into<String>, rtptime: u32, body: Vec<u8>) -> Self {
+        Self::new(RtspMethod::SetParameter, uri)
+            .header("Content-Type", "application/x-dmap-tagged")
+            .header("RTP-Info", format!("rtptime={}", rtptime))
+            .body(body)
+    }
+
+    /// Cover art (`content_type` is e.g. `image/jpeg` or `image/png`).
+    pub fn set_parameter_artwork(
+        uri: impl Into<String>,
+        rtptime: u32,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Self {
+        Self::new(RtspMethod::SetParameter, uri)
+            .header("Content-Type", content_type)
+            .header("RTP-Info", format!("rtptime={}", rtptime))
+            .body(body)
+    }
+
+    /// Playback progress, in RTP timestamps: track start / current / track end.
+    pub fn set_parameter_progress(uri: impl Into<String>, start: u32, current: u32, end: u32) -> Self {
+        Self::set_parameter_text(uri, format!("progress: {}/{}/{}\r\n", start, current, end).into_bytes())
+    }
+
     pub fn setpeers(_session_id: &str, body: Vec<u8>) -> Self {
         Self::new(RtspMethod::SetPeers, "/peer-list-changed")
             .content_type_bplist()
