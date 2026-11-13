@@ -230,6 +230,10 @@ pub struct Connection {
     spatial_speakers: Option<Vec<SpeakerConfig>>,
     /// Stream statistics (shared with control channel threads).
     stream_stats: Arc<crate::stats::StreamStats>,
+    /// RTP timestamp (in samples) at which the current live stream started.
+    /// 0 for the first stream; later streams on the same session continue the
+    /// timeline instead of restarting at 0 (see `start_streaming_live`).
+    stream_rtp_base: u64,
 }
 
 impl Connection {
@@ -352,6 +356,7 @@ impl Connection {
             spatial_params: None,
             spatial_speakers: None,
             stream_stats: crate::stats::StreamStats::new(),
+            stream_rtp_base: 0,
         })
     }
 
@@ -520,6 +525,7 @@ impl Connection {
             spatial_params: None,
             spatial_speakers: None,
             stream_stats: crate::stats::StreamStats::new(),
+            stream_rtp_base: 0,
         })
     }
 
@@ -724,6 +730,7 @@ impl Connection {
             spatial_params: None,
             spatial_speakers: None,
             stream_stats: crate::stats::StreamStats::new(),
+            stream_rtp_base: 0,
         })
     }
 
@@ -1075,12 +1082,42 @@ impl Connection {
         self.playback_state
     }
 
-    /// Get current playback position in seconds.
+    /// Get current playback position in seconds, relative to the start of the
+    /// current stream.
     pub fn playback_position(&self) -> f64 {
         self.streamer
             .as_ref()
-            .map(|s| s.position() as f64 / self.stream_config.audio_format.sample_rate.as_hz() as f64)
+            .map(|s| {
+                s.position().saturating_sub(self.stream_rtp_base) as f64
+                    / self.stream_config.audio_format.sample_rate.as_hz() as f64
+            })
             .unwrap_or(0.0)
+    }
+
+    /// RTP timestamp at which the current stream started (what a `progress:`
+    /// parameter's start/current/end values are relative to).
+    pub fn stream_rtp_base(&self) -> u32 {
+        self.stream_rtp_base as u32
+    }
+
+    /// RTP timestamp for the first packet of the next live stream.
+    ///
+    /// A receiver keeps one timeline per session. After a stream is stopped,
+    /// a new one that restarts at timestamp 0 lies in the receiver's past: it
+    /// drops the audio until the new timestamps catch up with where the old
+    /// stream had got to — i.e. silence for as long as the previous stream had
+    /// played. Continuing past the end of the previous stream (with a margin
+    /// beyond anything the receiver may still have buffered) avoids that.
+    fn next_stream_rtp_base(&self) -> u64 {
+        let previous_end = self.streamer.as_ref().map_or(0, |s| s.position());
+        if previous_end == 0 {
+            return 0;
+        }
+        let rate = self.stream_config.audio_format.sample_rate.as_hz() as u64;
+        let frames = (self.stream_config.audio_format.frames_per_packet as u64).max(1);
+        // One second of margin, aligned to a packet boundary so that
+        // `sequence = timestamp / frames` stays consistent with the timestamps.
+        (previous_end + rate).div_ceil(frames) * frames
     }
 
     /// Get current volume.
@@ -1091,7 +1128,11 @@ impl Connection {
     /// Start audio streaming from a decoder source.
     pub async fn start_streaming(&mut self, decoder: AudioDecoder) -> Result<()> {
         // Ensure setup is complete
-        if self.session.state() != SessionState::Ready {
+        // (A stopped stream leaves the session set up — reuse it, don't SETUP again.)
+        if !matches!(
+            self.session.state(),
+            SessionState::Ready | SessionState::Playing | SessionState::Paused
+        ) {
             self.setup().await?;
         }
 
@@ -1280,12 +1321,24 @@ impl Connection {
     /// receives PCM frames from a channel, enabling streaming from external sources.
     pub async fn start_streaming_live(&mut self, live_decoder: LiveAudioDecoder) -> Result<()> {
         // Ensure setup is complete
-        if self.session.state() != SessionState::Ready {
+        // (A stopped stream leaves the session set up — reuse it, don't SETUP again.)
+        if !matches!(
+            self.session.state(),
+            SessionState::Ready | SessionState::Playing | SessionState::Paused
+        ) {
             self.setup().await?;
         }
 
+        // Continue the receiver's RTP timeline (and sequence numbers) rather
+        // than restarting at 0 — see `next_stream_rtp_base`.
+        let rtp_base = self.next_stream_rtp_base();
+        let frames_per_packet = (self.stream_config.audio_format.frames_per_packet as u64).max(1);
+        let base_sequence = (rtp_base / frames_per_packet) as u16;
+        self.stream_rtp_base = rtp_base;
+
         // Configure RTP sender using shared builder
-        let sender = self.build_rtp_sender()?;
+        let mut sender = self.build_rtp_sender()?;
+        sender.set_next_sequence(base_sequence);
         info!("Live streaming: ChaCha20-Poly1305 audio encryption enabled");
 
         // Start streamer
@@ -1317,16 +1370,23 @@ impl Connection {
             streamer.set_spatial_params(params, speakers).await;
         }
 
-        // FLUSH before streaming
+        // FLUSH before streaming: clear the receiver's buffers and tell it the
+        // next audio starts at this seq/rtptime (0/0 for the first stream, the
+        // continuation of the timeline for later ones).
         let flush_req = RtspRequest::flush_with_info(
             self.session.request_uri(),
-            0,
-            0,
+            base_sequence,
+            rtp_base as u32,
         );
         if let Err(e) = self.rtsp.send(flush_req).await {
             tracing::warn!("FLUSH failed (continuing anyway): {}", e);
         } else {
-            tracing::info!("FLUSH sent before live streaming");
+            tracing::info!("FLUSH sent before live streaming (seq={}, rtptime={})", base_sequence, rtp_base as u32);
+        }
+
+        // The streamer's first packet carries this timestamp.
+        if rtp_base > 0 {
+            streamer.seek(rtp_base).await?;
         }
 
         // Start live streaming

@@ -417,6 +417,13 @@ impl RtpSender {
         }
     }
 
+    /// Set the sequence number of the next audio packet. A stream that
+    /// continues the RTP timeline (a new track on an already-playing session)
+    /// must also continue the sequence numbers.
+    pub fn set_next_sequence(&mut self, sequence: u16) {
+        self.sequence = sequence;
+    }
+
     /// Set control port destination for sync packets.
     pub fn set_control_dest(&mut self, dest: SocketAddr) {
         self.control_dest = Some(dest);

@@ -466,8 +466,14 @@ impl RtspSession {
     }
 
     /// Transition to playing state.
+    ///
+    /// Also allowed from `Playing`: after a stream is stopped (FLUSH) the RTSP
+    /// session stays set up, so the next track starts a new stream on it.
     pub fn start_playing(&mut self) -> Result<()> {
-        if self.state != SessionState::Ready && self.state != SessionState::Paused {
+        if self.state != SessionState::Ready
+            && self.state != SessionState::Paused
+            && self.state != SessionState::Playing
+        {
             return Err(RtspError::SetupFailed(format!(
                 "Cannot start playing from state {:?}",
                 self.state
@@ -756,6 +762,37 @@ mod tests {
 
             assert!(session.pause().is_ok());
             assert_eq!(session.state(), SessionState::Paused);
+        }
+
+        #[test]
+        fn playing_can_restart_after_stop() {
+            let device = make_test_device();
+            let mut session = RtspSession::new(device, StreamConfig::default());
+
+            session.set_connected().unwrap();
+            session.set_paired().unwrap();
+            session
+                .process_setup_phase1_response(&plist_codec::encode(&SetupPhase1Response {
+                    event_port: 58168,
+                    timing_port: 58169,
+                    timing_peer_info: None,
+                }).unwrap())
+                .unwrap();
+            session
+                .process_setup_phase2_response(&plist_codec::encode(&SetupPhase2Response {
+                    streams: vec![crate::plist_codec::StreamResponse {
+                        stream_type: 96,
+                        data_port: 58170,
+                        control_port: 58171,
+                        stream_id: 1,
+                    }],
+                }).unwrap())
+                .unwrap();
+
+            session.start_playing().unwrap();
+            // A second stream on the same session (next track) must be allowed.
+            assert!(session.start_playing().is_ok());
+            assert_eq!(session.state(), SessionState::Playing);
         }
 
         #[test]
