@@ -5,10 +5,11 @@
 use airplay_core::error::{Error, Result};
 use async_trait::async_trait;
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket as TokioUdpSocket;
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use crate::{Clock, ClockOffset, TimingProtocol, ntp_to_unix};
 
 /// RTP payload type for timing request.
@@ -363,6 +364,10 @@ pub struct NtpTimingServer {
     port: u16,
     shutdown_tx: watch::Sender<bool>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Number of timing requests answered so far.
+    served: Arc<AtomicU64>,
+    /// Notified after each answered request (see [`Self::wait_for_requests`]).
+    served_notify: Arc<Notify>,
 }
 
 impl NtpTimingServer {
@@ -375,9 +380,14 @@ impl NtpTimingServer {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let clock = Clock::new(sample_rate);
 
+        let served = Arc::new(AtomicU64::new(0));
+        let served_notify = Arc::new(Notify::new());
+
         let task_socket = socket.clone();
+        let task_served = served.clone();
+        let task_notify = served_notify.clone();
         let task_handle = tokio::spawn(async move {
-            Self::run_loop(task_socket, clock, shutdown_rx).await;
+            Self::run_loop(task_socket, clock, shutdown_rx, task_served, task_notify).await;
         });
 
         Ok(Self {
@@ -385,7 +395,31 @@ impl NtpTimingServer {
             port,
             shutdown_tx,
             task_handle: Some(task_handle),
+            served,
+            served_notify,
         })
+    }
+
+    /// Wait until at least `min_requests` timing requests have been answered,
+    /// or `timeout` elapses. Returns whether the threshold was reached.
+    ///
+    /// Receivers such as Apple TV start their NTP exchange right after SETUP
+    /// phase 1 and answer an early SETUP phase 2 with `400 Bad Request` if
+    /// it overtakes that exchange, so callers should wait here first.
+    pub async fn wait_for_requests(&self, min_requests: u64, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.served_notify.notified();
+            tokio::pin!(notified);
+            // Register for wake-ups before checking, so one arriving in between isn't lost.
+            notified.as_mut().enable();
+            if self.served.load(Ordering::Acquire) >= min_requests {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.served.load(Ordering::Acquire) >= min_requests;
+            }
+        }
     }
 
     /// Get the local port number.
@@ -405,6 +439,8 @@ impl NtpTimingServer {
         socket: Arc<TokioUdpSocket>,
         clock: Clock,
         mut shutdown_rx: watch::Receiver<bool>,
+        served: Arc<AtomicU64>,
+        served_notify: Arc<Notify>,
     ) {
         let mut buf = [0u8; 64];
         loop {
@@ -417,6 +453,8 @@ impl NtpTimingServer {
                             let response = NtpResponse::from_request(&request, recv_time, send_time);
                             let _ = socket.send_to(&response.serialize(), addr).await;
                             tracing::debug!("NTP timing: responded to request seq={}", request.sequence);
+                            served.fetch_add(1, Ordering::Release);
+                            served_notify.notify_waiters();
                         }
                     }
                 }
@@ -711,6 +749,43 @@ mod tests {
                 finished.is_ok(),
                 "run_loop still running 2s after the server was dropped (busy loop)"
             );
+        }
+
+        #[tokio::test]
+        async fn wait_for_requests_times_out_without_requests() {
+            let mut server = NtpTimingServer::start(44100).await.unwrap();
+            let reached = server
+                .wait_for_requests(1, std::time::Duration::from_millis(50))
+                .await;
+            assert!(!reached);
+            server.stop().await;
+        }
+
+        #[tokio::test]
+        async fn wait_for_requests_returns_once_request_answered() {
+            let mut server = NtpTimingServer::start(44100).await.unwrap();
+            let port = server.port();
+            let client_socket = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+            let request = NtpRequest {
+                sequence: 7,
+                reference_time: unix_to_ntp(1_000_000_000),
+            };
+            // Send shortly after the wait starts, to exercise the wake-up path.
+            let sender = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                client_socket
+                    .send_to(&request.serialize(), format!("127.0.0.1:{}", port))
+                    .await
+                    .unwrap();
+            });
+
+            let reached = server
+                .wait_for_requests(1, std::time::Duration::from_secs(2))
+                .await;
+            assert!(reached);
+            sender.await.unwrap();
+            server.stop().await;
         }
     }
 
