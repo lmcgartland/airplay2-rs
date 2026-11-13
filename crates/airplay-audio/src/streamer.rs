@@ -877,14 +877,27 @@ impl AudioStreamer {
         // and stops producing into the bounded channel.
         self.state_cache.store(StreamerState::Stopped as u8, Ordering::Relaxed);
 
-        // Signal sender thread to stop
-        if let Some(ref tx) = self.sender_tx {
-            let _ = tx.try_send(SenderMessage::Stop);
+        // Cancel the run_streamer task first: it holds its own clone of the
+        // channel's Sender, so while it lives the channel can't disconnect —
+        // and the channel is normally full (that's its backpressure), so the
+        // Stop message below usually can't be delivered either. Aborting it
+        // after the join (as this used to) made every stop wait out the full
+        // join timeout.
+        if let Some(task) = self.task.take() {
+            task.abort();
         }
-        // Drop sender_tx to disconnect the channel — guarantees the sender
-        // thread's rx.recv() returns Err and exits, even if the Stop message
-        // couldn't be delivered (channel was full).
-        self.sender_tx = None;
+
+        // Signal sender thread to stop. The channel is normally full (that is
+        // its backpressure), so a `try_send` usually fails and the thread would
+        // never see Stop — and dropping our Sender doesn't disconnect the
+        // channel while clones of this streamer still hold one. Wait (bounded)
+        // for room instead: the sender thread frees a slot every few ms.
+        if let Some(tx) = self.sender_tx.take() {
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = tx.send_timeout(SenderMessage::Stop, Duration::from_millis(500));
+            })
+            .await;
+        }
 
         // Now safe to join — sender thread will exit from channel disconnect.
         // Use a timeout to prevent hanging if the thread is stuck in I/O.
@@ -895,11 +908,6 @@ impl AudioStreamer {
                     let _ = handle.join();
                 }),
             ).await;
-        }
-
-        // Cancel the run_streamer task if still running
-        if let Some(task) = self.task.take() {
-            task.abort();
         }
 
         let mut inner = self.inner.lock().await;
