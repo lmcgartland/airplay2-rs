@@ -64,6 +64,20 @@ impl SessionKeys {
         })
     }
 
+    /// Derive the keys of the events channel (the connection the receiver
+    /// opens requests on). The `Events-Write`/`Events-Read` names do not say
+    /// which side writes with which key, so callers should check which
+    /// assignment authenticates the first frame.
+    pub fn derive_events_keys(shared_secret: &SharedSecret) -> Result<Self, CryptoError> {
+        let write_key = hkdf::derive_events_write_key(shared_secret.as_bytes())?;
+        let read_key = hkdf::derive_events_read_key(shared_secret.as_bytes())?;
+
+        Ok(Self {
+            write_key: EncryptionKey(write_key),
+            read_key: EncryptionKey(read_key),
+        })
+    }
+
     /// Derive session keys for pair-setup encryption.
     pub fn derive_pair_setup_keys(
         shared_secret: &SharedSecret,

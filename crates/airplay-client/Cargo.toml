@@ -15,6 +15,7 @@ airplay-rtsp = { path = "../airplay-rtsp" }
 airplay-audio = { path = "../airplay-audio" }
 airplay-timing = { path = "../airplay-timing" }
 tokio.workspace = true
+plist.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
