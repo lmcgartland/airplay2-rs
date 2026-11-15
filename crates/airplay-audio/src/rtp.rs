@@ -15,47 +15,28 @@ use std::time::Duration;
 /// Also enlarges the kernel send buffer (SO_SNDBUF) to 1MB to prevent drops
 /// when bursting packets to multiple group devices simultaneously.
 fn set_socket_qos(socket: &UdpSocket) {
-    use std::os::unix::io::AsRawFd;
-    let fd = socket.as_raw_fd();
+    // socket2 wraps the platform socket API, so this works on Unix and Windows.
+    let sock = socket2::SockRef::from(socket);
 
     // IP_TOS = DSCP EF (0xB8 = 184). The TOS byte is: DSCP (6 bits) + ECN (2 bits).
     // EF = 46 << 2 = 0xB8.
-    let tos: libc::c_int = 0xB8;
-    unsafe {
-        let ret = libc::setsockopt(
-            fd,
-            libc::IPPROTO_IP,
-            libc::IP_TOS,
-            &tos as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        if ret != 0 {
-            tracing::debug!("Failed to set IP_TOS (DSCP EF): errno={}", std::io::Error::last_os_error());
-        }
+    if let Err(e) = sock.set_tos(0xB8) {
+        tracing::debug!("Failed to set IP_TOS (DSCP EF): {}", e);
     }
 
     // Enlarge send buffer to 1MB. Default is often 128-212KB which can cause
     // kernel-side drops when bursting to multiple group devices at once.
-    unsafe {
-        let buf_size: libc::c_int = 1024 * 1024; // 1MB
-        let ret = libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &buf_size as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        if ret != 0 {
-            tracing::debug!("Failed to set SO_SNDBUF: errno={}", std::io::Error::last_os_error());
-        }
+    if let Err(e) = sock.set_send_buffer_size(1024 * 1024) {
+        tracing::debug!("Failed to set SO_SNDBUF: {}", e);
     }
 
     // On Linux, also set SO_PRIORITY = 6 (maps to TC prio band for AC_VO)
     #[cfg(target_os = "linux")]
     unsafe {
+        use std::os::unix::io::AsRawFd;
         let prio: libc::c_int = 6;
         let ret = libc::setsockopt(
-            fd,
+            socket.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_PRIORITY,
             &prio as *const _ as *const libc::c_void,
