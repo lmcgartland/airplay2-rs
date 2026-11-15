@@ -35,6 +35,9 @@ pub struct Resampler {
     channels: usize,
     source_rate: u32,
     target_rate: u32,
+    /// Input frames not yet resampled, per channel: `SincFixedIn` takes
+    /// exactly one chunk per call, while callers hand in blocks of any size.
+    pending: Vec<Vec<f32>>,
 }
 
 impl Resampler {
@@ -107,6 +110,7 @@ impl Resampler {
             channels: channels_usize,
             source_rate,
             target_rate,
+            pending: vec![Vec::new(); channels_usize],
         })
     }
 
@@ -133,6 +137,7 @@ impl Resampler {
     /// Reset the resampler state (for seeking).
     pub fn reset(&mut self) {
         self.inner.reset();
+        self.pending.iter_mut().for_each(Vec::clear);
 
         // Re-prime after reset
         let input_frames_needed = self.inner.input_frames_next();
@@ -180,15 +185,41 @@ impl Resampler {
     ///
     /// This is the more efficient path when samples are already in f32 format
     /// (e.g., from ALSA S24 capture).
+    ///
+    /// The input may have any length. The underlying `SincFixedIn` consumes
+    /// exactly one chunk (`input_frames_next()`) per call — it silently drops
+    /// any frames beyond that and rejects shorter input — so the input is
+    /// buffered and resampled in whole chunks; a remainder shorter than a chunk
+    /// waits for the next call. The output may therefore be empty, or span
+    /// several chunks.
     pub fn process_f32(&mut self, channels: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
         if channels.is_empty() || channels[0].is_empty() {
             return Ok(Vec::new());
         }
 
-        self.inner.process(channels, None).map_err(|e| {
-            airplay_core::error::StreamingError::Encoding(format!("Resampling error: {}", e))
-                .into()
-        })
+        for (pending, input) in self.pending.iter_mut().zip(channels) {
+            pending.extend_from_slice(input);
+        }
+
+        let mut output: Vec<Vec<f32>> = vec![Vec::new(); self.channels];
+        loop {
+            let needed = self.inner.input_frames_next();
+            if self.pending[0].len() < needed {
+                break;
+            }
+            let chunk: Vec<Vec<f32>> = self
+                .pending
+                .iter_mut()
+                .map(|pending| pending.drain(..needed).collect())
+                .collect();
+            let resampled = self.inner.process(&chunk, None).map_err(|e| {
+                airplay_core::error::StreamingError::Encoding(format!("Resampling error: {}", e))
+            })?;
+            for (out, frames) in output.iter_mut().zip(resampled) {
+                out.extend(frames);
+            }
+        }
+        Ok(output)
     }
 }
 
@@ -433,6 +464,69 @@ mod tests {
             let channels: Vec<Vec<f32>> = vec![];
             let output = interleave_with_dither(&channels);
             assert!(output.is_empty());
+        }
+    }
+
+    mod input_sizes {
+        use super::*;
+
+        /// Count output frames for `total` input frames fed in blocks of `block`.
+        fn output_frames(source: u32, target: u32, block: usize, total: usize) -> usize {
+            let mut resampler = Resampler::new(source, target, 2).unwrap();
+            let mut out = 0;
+            let mut fed = 0;
+            while fed < total {
+                let n = block.min(total - fed);
+                let input = generate_sine_wave_i16(1000.0, source, n);
+                out += resampler.process(&input).unwrap().len() / 2;
+                fed += n;
+            }
+            out
+        }
+
+        #[test]
+        fn blocks_larger_than_a_chunk_are_not_truncated() {
+            // 96 kHz FLAC delivers 4608-frame blocks: everything must be
+            // resampled, not just the first 1024 frames.
+            let total = 96000;
+            let out = output_frames(96000, 44100, 4608, total);
+            let expected = (total as f64 * 44100.0 / 96000.0) as usize;
+            assert!(
+                out + 2 * DEFAULT_CHUNK_SIZE >= expected && out <= expected + DEFAULT_CHUNK_SIZE,
+                "got {out} frames, expected about {expected}"
+            );
+        }
+
+        #[test]
+        fn blocks_of_any_size_give_the_same_amount_of_audio() {
+            let total = 48000;
+            let reference = output_frames(48000, 44100, 1024, total);
+            for block in [100, 1152, 4096] {
+                let out = output_frames(48000, 44100, block, total);
+                let diff = (out as i64 - reference as i64).abs();
+                assert!(diff <= DEFAULT_CHUNK_SIZE as i64, "block {block}: {out} vs {reference}");
+            }
+        }
+
+        #[test]
+        fn short_blocks_are_accepted() {
+            let mut resampler = Resampler::new(96000, 44100, 2).unwrap();
+            assert!(resampler.process(&generate_sine_wave_i16(1000.0, 96000, 100)).is_ok());
+        }
+
+        #[test]
+        fn pitch_is_preserved() {
+            // A 1 kHz tone must still be 1 kHz after 96 -> 44.1 kHz.
+            let mut resampler = Resampler::new(96000, 44100, 2).unwrap();
+            let mut out = Vec::new();
+            for _ in 0..20 {
+                out.extend(resampler.process(&generate_sine_wave_i16(1000.0, 96000, 4608)).unwrap());
+            }
+            let left: Vec<i16> = out.chunks_exact(2).map(|f| f[0]).collect();
+            let rising = left.windows(2).filter(|w| w[0] < 0 && w[1] >= 0).count();
+            let seconds = left.len() as f64 / 44100.0;
+            let hz = rising as f64 / seconds;
+            assert!((hz - 1000.0).abs() < 30.0, "measured {hz} Hz");
         }
     }
 
